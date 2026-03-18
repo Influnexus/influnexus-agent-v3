@@ -457,9 +457,18 @@ async def run_full_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE, nich
     # Run full research
     contacts = await full_research(niche, region, count, update)
 
-    if not contacts:
-        await update.message.reply_text("❌ Research failed. Try a more specific niche or region.")
-        return
+            # Fallback search if first attempt fails
+        if not contacts:
+            relaxed_niche = " ".join([w for w in niche.split() if w.lower() not in ["from","in","at","the"]])
+            contacts = await full_research(relaxed_niche, region, count, update)
+
+        if not contacts:
+            await update.message.reply_text(
+                "❌ Research failed.\n\n💡 Try:\n• `/run dental clinic Dubai 5`\n• Use simpler niche\n• Try smaller count like 5",
+                parse_mode="Markdown"
+            )
+            return
+
 
     emails_found = sum(1 for c in contacts if c["email"] != "Search")
 
