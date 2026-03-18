@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
 import httpx
-import anthropic
+import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import (
@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 
 # ─── Environment Variables ─────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-CLAUDE_API_KEY    = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 GOOGLE_SHEET_ID   = os.environ["GOOGLE_SHEET_ID"]
 ALLOWED_USER_ID   = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
@@ -525,10 +525,16 @@ class EmailEngine:
     """Handles all email sending — GMass for bulk, SMTP for follow-ups."""
 
     def __init__(self):
-        self.claude = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        if GEMINI_API_KEY:
+            genai.configure(api_key=GEMINI_API_KEY)
+            self.model = genai.GenerativeModel("gemini-2.0-flash")
+            log.info("Gemini AI configured for email generation.")
+        else:
+            self.model = None
+            log.warning("GEMINI_API_KEY not set — will use fallback emails.")
 
     def generate_email(self, lead: dict, email_type: str = "initial") -> dict:
-        """Use Claude to generate a personalized email."""
+        """Use Gemini to generate a personalized email."""
         if email_type == "initial":
             prompt = f"""Write a professional, warm, and personalized cold outreach email from Rohit at InfluNexus.
 
@@ -552,7 +558,7 @@ Guidelines:
 - Include the Calendly link: {CALENDLY_LINK}
 - Sign off as: Rohit | Founder, InfluNexus | {COMPANY_WEBSITE}
 
-Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
+Return ONLY a JSON object with "subject" and "body" keys. No markdown, no code fences."""
 
         elif email_type == "followup_1":
             prompt = f"""Write a follow-up email (1st follow-up, 3 days after initial outreach) from Rohit at InfluNexus.
@@ -568,7 +574,7 @@ Guidelines:
 - Include Calendly: {CALENDLY_LINK}
 - Sign off as: Rohit | InfluNexus
 
-Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
+Return ONLY a JSON object with "subject" and "body" keys. No markdown, no code fences."""
 
         elif email_type == "followup_2":
             prompt = f"""Write a 2nd follow-up email (7 days after initial outreach) from Rohit at InfluNexus.
@@ -583,24 +589,23 @@ Guidelines:
 - Last gentle nudge with Calendly: {CALENDLY_LINK}
 - Sign off as: Rohit | InfluNexus
 
-Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
+Return ONLY a JSON object with "subject" and "body" keys. No markdown, no code fences."""
 
         else:
             return {"subject": "InfluNexus - Creative & AI Production", "body": "Hi there"}
 
         try:
-            response = self.claude.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            text = response.content[0].text.strip()
+            if not self.model:
+                raise Exception("Gemini not configured")
+            response = self.model.generate_content(prompt)
+            text = response.text.strip()
             # Clean up potential markdown
             text = re.sub(r'^```json\s*', '', text)
             text = re.sub(r'\s*```$', '', text)
+            text = text.strip()
             return json.loads(text)
         except Exception as e:
-            log.error(f"Claude email generation failed: {e}")
+            log.error(f"Gemini email generation failed: {e}")
             return {
                 "subject": f"Creative & AI Production for {lead.get('company', 'your brand')} — InfluNexus",
                 "body": f"Hi {lead.get('contact_name', 'there')},\n\nI'm Rohit from InfluNexus — we're a creative & AI production agency working across UAE, India, and the UK.\n\nI'd love to explore how we could support {lead.get('company', 'your brand')} with premium video, AI visuals, or digital campaigns.\n\nWould you be open to a quick 15-min chat?\n\nBook a time: {CALENDLY_LINK}\n\nBest,\nRohit\nFounder, InfluNexus\n{COMPANY_WEBSITE}"
@@ -1218,19 +1223,15 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=(
+        model = genai.GenerativeModel("gemini-2.0-flash",
+            system_instruction=(
                 "You are Rohit's AI sales assistant at InfluNexus, a creative & AI production agency. "
                 "Help with sales strategy, email writing, lead qualification, and business development. "
                 "Be concise and actionable. "
                 f"Company info: {INFLUNEXUS_PITCH}"
-            ),
-            messages=[{"role": "user", "content": text}]
-        )
-        reply = response.content[0].text
+            ))
+        response = model.generate_content(text)
+        reply = response.text
         # Truncate if too long for Telegram
         if len(reply) > 4000:
             reply = reply[:4000] + "..."
@@ -1343,7 +1344,7 @@ def main():
 
     log.info("🚀 InfluNexus Agent Bot v4 starting...")
     log.info(f"   Telegram: ✅ configured")
-    log.info(f"   Claude AI: {'✅' if CLAUDE_API_KEY else '❌'}")
+    log.info(f"   Gemini AI: {'✅' if GEMINI_API_KEY else '❌'}")
     log.info(f"   Google Sheets: {'✅' if crm.sheet else '❌'}")
     log.info(f"   Apollo: {'✅' if APOLLO_API_KEY else '❌ (skipped)'}")
     log.info(f"   Hunter: {'✅' if HUNTER_API_KEY else '❌ (skipped)'}")
