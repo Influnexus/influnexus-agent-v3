@@ -65,7 +65,20 @@ CALENDLY_LINK     = os.environ.get("CALENDLY_LINK", "https://calendly.com/influn
 GCAL_CALENDAR_ID  = os.environ.get("GCAL_CALENDAR_ID", "primary")
 
 # Google Service Account JSON (stored as env var on Railway)
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+_raw_creds = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+# Handle cases where the JSON might be escaped or have extra quotes
+try:
+    _test = json.loads(_raw_creds)
+    GOOGLE_CREDS_JSON = _raw_creds
+except json.JSONDecodeError:
+    try:
+        # Try unescaping if Railway double-escaped it
+        _raw_creds = _raw_creds.replace('\\"', '"').replace("\\n", "\n")
+        _test = json.loads(_raw_creds)
+        GOOGLE_CREDS_JSON = _raw_creds
+    except json.JSONDecodeError:
+        log.error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Check the env variable.")
+        GOOGLE_CREDS_JSON = "{}"
 
 # ─── Constants ─────────────────────────────────────────────
 INFLUNEXUS_PITCH = """InfluNexus (by Raah Enterprises) is a full-service creative & AI production agency operating across UAE, India, UK, and global markets.
@@ -106,6 +119,9 @@ class CRM:
     def _connect(self):
         try:
             creds_dict = json.loads(GOOGLE_CREDS_JSON)
+            if not creds_dict or "type" not in creds_dict:
+                log.error("CRM: Google Service Account JSON is empty or invalid. Check GOOGLE_SERVICE_ACCOUNT_JSON env var.")
+                return
             scope = [
                 "https://spreadsheets.google.com/feeds",
                 "https://www.googleapis.com/auth/drive",
@@ -1302,7 +1318,11 @@ def main():
 
     # Background job: auto follow-ups every 6 hours
     job_queue = app.job_queue
-    job_queue.run_repeating(followup_job, interval=21600, first=60)
+    if job_queue:
+        job_queue.run_repeating(followup_job, interval=21600, first=60)
+        log.info("Follow-up scheduler enabled (every 6 hours).")
+    else:
+        log.warning("Job queue not available — follow-ups must be triggered manually.")
 
     log.info("🚀 InfluNexus Agent Bot v4 starting...")
     app.run_polling(drop_pending_updates=True)
