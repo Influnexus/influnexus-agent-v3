@@ -1,727 +1,1312 @@
 """
-InfluNexus Autonomous Agent Bot v3
-====================================
-Full end-to-end pipeline from one iPhone message:
+InfluNexus Autonomous Sales Agent Bot v4
+=========================================
+Full-stack Telegram bot that:
+1. Searches for business contacts (Apollo, Hunter, SerpAPI)
+2. Stores leads in Google Sheets CRM
+3. Sends personalized outreach emails (GMass bulk + SMTP follow-ups)
+4. Books meetings via Google Calendar + Meet
+5. Manages follow-up sequences automatically
+6. Uses Claude AI for personalized email generation
 
-1. FIND    — Search Google/web for companies in any niche + region
-2. SCRAPE  — Visit every company website, extract real contacts
-3. ENRICH  — Find decision maker names, emails, phone, LinkedIn
-4. VERIFY  — Verify emails are real before sending
-5. UPLOAD  — Push to Google Sheet + export CSV
-6. SEND    — Launch GMass campaign automatically
-7. FOLLOW  — Auto follow-up sequence (Day 3, Day 7)
-8. BOOK    — Calendly link in every email for call booking
-9. REPORT  — Daily summary back to you on Telegram
-
-One message on iPhone → everything above happens automatically.
+Deploy on Railway with environment variables.
 """
 
-import os, json, asyncio, logging, re, csv, io
-from datetime import datetime
-from urllib.parse import urlparse, urljoin
-import anthropic
+import os
+import json
+import asyncio
+import logging
+import re
+import smtplib
+import hashlib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
+from urllib.parse import quote_plus
+
 import httpx
+import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 )
 
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+# ─── Logging ───────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO
+)
 log = logging.getLogger(__name__)
 
-# ── CONFIG ───────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-CLAUDE_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
-GOOGLE_SHEET_ID  = os.environ["GOOGLE_SHEET_ID"]
-ALLOWED_USER_ID  = int(os.environ.get("ALLOWED_USER_ID", "0"))
-GMASS_API_KEY    = os.environ.get("GMASS_API_KEY", "")
-CALENDLY_LINK    = os.environ.get("CALENDLY_LINK", "https://calendly.com/influnexus")
-SERPAPI_KEY      = os.environ.get("SERPAPI_KEY", "")  # for Google search
+# ─── Environment Variables ─────────────────────────────────
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+CLAUDE_API_KEY    = os.environ["ANTHROPIC_API_KEY"]
+GOOGLE_SHEET_ID   = os.environ["GOOGLE_SHEET_ID"]
+ALLOWED_USER_ID   = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
-# ── AI CLIENT ────────────────────────────────────────────────────
-ai = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+# API Keys for lead finding
+APOLLO_API_KEY    = os.environ.get("APOLLO_API_KEY", "")
+HUNTER_API_KEY    = os.environ.get("HUNTER_API_KEY", "")
+SERPAPI_KEY        = os.environ.get("SERPAPI_KEY", "")
 
-# ── GOOGLE SHEETS ────────────────────────────────────────────────
-GSCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+# Email sending
+GMASS_API_KEY     = os.environ.get("GMASS_API_KEY", "")
+SMTP_EMAIL        = os.environ.get("SMTP_EMAIL", "info@influnexus.com")
+SMTP_PASSWORD     = os.environ.get("SMTP_PASSWORD", "")
 
-def get_sheet():
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(
-        json.loads(os.environ.get("GOOGLE_CREDS_JSON", "{}")), GSCOPE
-    )
-    return gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
+# Google Calendar
+CALENDLY_LINK     = os.environ.get("CALENDLY_LINK", "https://calendly.com/influnexus")
+GCAL_CALENDAR_ID  = os.environ.get("GCAL_CALENDAR_ID", "primary")
 
-def write_sheet(tab: str, headers: list, rows: list) -> str:
-    try:
-        sheet = get_sheet()
+# Google Service Account JSON (stored as env var on Railway)
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+
+# ─── Constants ─────────────────────────────────────────────
+INFLUNEXUS_PITCH = """InfluNexus (by Raah Enterprises) is a full-service creative & AI production agency operating across UAE, India, UK, and global markets.
+
+Our Services:
+• Cinematic Video Production & CGI/VFX
+• AI-Generated Visuals & Motion Graphics
+• Branding & Digital Marketing
+• Web & App Development
+• Influencer Marketing & Social Media Management
+
+We've worked with brands like ADCB Bank, delivering premium creative campaigns that drive real business results."""
+
+COMPANY_WEBSITE = "https://influnexus.com"
+
+# Conversation states
+(SEARCH_INDUSTRY, SEARCH_LOCATION, SEARCH_COUNT,
+ CONFIRM_OUTREACH, CUSTOM_MESSAGE, FOLLOWUP_SETUP) = range(6)
+
+
+# ═══════════════════════════════════════════════════════════
+#  GOOGLE SHEETS CRM
+# ═══════════════════════════════════════════════════════════
+class CRM:
+    """Google Sheets-based CRM for lead management."""
+
+    HEADERS = [
+        "ID", "Company", "Contact Name", "Email", "Phone",
+        "Industry", "Location", "Source", "Status",
+        "Last Contacted", "Next Follow-up", "Notes", "Created"
+    ]
+
+    def __init__(self):
+        self.client = None
+        self.sheet = None
+        self._connect()
+
+    def _connect(self):
         try:
-            ws = sheet.worksheet(tab)
-            ws.clear()
-        except gspread.WorksheetNotFound:
-            ws = sheet.add_worksheet(title=tab, rows=500, cols=25)
-        ws.update([headers] + rows, "A1")
-        ws.format("A1:Z1", {"textFormat": {"bold": True}})
-        return f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
-    except Exception as e:
-        log.error(f"Sheet error: {e}")
-        raise
+            creds_dict = json.loads(GOOGLE_CREDS_JSON)
+            scope = [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/calendar"
+            ]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            self.client = gspread.authorize(creds)
+            self.sheet = self.client.open_by_key(GOOGLE_SHEET_ID)
+            self._ensure_worksheets()
+            log.info("Google Sheets CRM connected.")
+        except Exception as e:
+            log.error(f"CRM connection failed: {e}")
 
-def make_csv(headers: list, rows: list) -> bytes:
-    buf = io.StringIO()
-    w   = csv.writer(buf)
-    w.writerow(headers)
-    w.writerows(rows)
-    return buf.getvalue().encode()
+    def _ensure_worksheets(self):
+        """Create worksheets if they don't exist."""
+        existing = [ws.title for ws in self.sheet.worksheets()]
 
-# ── WEB SCRAPER ──────────────────────────────────────────────────
-EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
-PHONE_RE = re.compile(r'[\+]?[\d\s\-\(\)]{9,17}')
+        if "Leads" not in existing:
+            ws = self.sheet.add_worksheet("Leads", rows=5000, cols=15)
+            ws.append_row(self.HEADERS)
+            log.info("Created 'Leads' worksheet.")
 
-SKIP_EMAILS = {"example.com", "sentry.io", "wixpress.com", "squarespace.com",
-               "shopify.com", "wordpress.com", "gmail.com", "yahoo.com"}
+        if "Outreach Log" not in existing:
+            ws = self.sheet.add_worksheet("Outreach Log", rows=5000, cols=10)
+            ws.append_row([
+                "Lead ID", "Email", "Type", "Subject",
+                "Status", "Sent At", "Opened", "Replied", "Notes"
+            ])
+            log.info("Created 'Outreach Log' worksheet.")
 
-async def scrape_website(url: str) -> dict:
-    """Visit a company website and extract contact details."""
-    result = {"url": url, "emails": [], "phones": [], "contact_page": "", "raw_text": ""}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            # Try main page
-            resp = await client.get(url, headers=headers)
-            text = resp.text
-            result["raw_text"] = text[:5000]
+        if "Follow-ups" not in existing:
+            ws = self.sheet.add_worksheet("Follow-ups", rows=5000, cols=8)
+            ws.append_row([
+                "Lead ID", "Email", "Follow-up #",
+                "Scheduled Date", "Status", "Sent At", "Content"
+            ])
+            log.info("Created 'Follow-ups' worksheet.")
 
-            # Extract emails from main page
-            found_emails = EMAIL_RE.findall(text)
-            valid_emails = [e for e in found_emails
-                           if not any(skip in e for skip in SKIP_EMAILS)
-                           and not e.endswith(('.png', '.jpg', '.css', '.js'))]
-            result["emails"].extend(valid_emails)
+    def add_lead(self, data: dict) -> str:
+        """Add a lead to the CRM. Returns the lead ID."""
+        try:
+            ws = self.sheet.worksheet("Leads")
+            lead_id = hashlib.md5(
+                f"{data.get('email','')}{data.get('company','')}".encode()
+            ).hexdigest()[:8].upper()
 
-            # Extract phones
-            result["phones"] = PHONE_RE.findall(text)[:3]
+            row = [
+                lead_id,
+                data.get("company", ""),
+                data.get("contact_name", ""),
+                data.get("email", ""),
+                data.get("phone", ""),
+                data.get("industry", ""),
+                data.get("location", ""),
+                data.get("source", ""),
+                "New",
+                "",
+                "",
+                data.get("notes", ""),
+                datetime.now().strftime("%Y-%m-%d %H:%M")
+            ]
+            ws.append_row(row)
+            return lead_id
+        except Exception as e:
+            log.error(f"Failed to add lead: {e}")
+            return ""
 
-            # Try contact page
-            contact_paths = ["/contact", "/contact-us", "/about", "/team", "/about-us"]
-            for path in contact_paths:
-                try:
-                    contact_url = urljoin(url, path)
-                    cresp = await client.get(contact_url, headers=headers)
-                    if cresp.status_code == 200:
-                        ctext = cresp.text
-                        more_emails = EMAIL_RE.findall(ctext)
-                        valid_more = [e for e in more_emails
-                                     if not any(skip in e for skip in SKIP_EMAILS)]
-                        result["emails"].extend(valid_more)
-                        result["contact_page"] = contact_url
-                        break
-                except Exception:
-                    continue
+    def get_leads_by_status(self, status: str) -> list:
+        """Get all leads with a given status."""
+        try:
+            ws = self.sheet.worksheet("Leads")
+            records = ws.get_all_records()
+            return [r for r in records if r.get("Status") == status]
+        except Exception as e:
+            log.error(f"Failed to get leads: {e}")
+            return []
 
-        # Deduplicate and prioritise business emails
-        all_emails = list(dict.fromkeys(result["emails"]))
-        priority = [e for e in all_emails if any(kw in e.lower()
-                    for kw in ["info", "contact", "hello", "marketing", "press",
-                               "media", "sales", "business", "team", "brand"])]
-        other = [e for e in all_emails if e not in priority]
-        result["emails"] = (priority + other)[:5]
+    def update_lead_status(self, lead_id: str, status: str):
+        """Update lead status by ID."""
+        try:
+            ws = self.sheet.worksheet("Leads")
+            cell = ws.find(lead_id)
+            if cell:
+                ws.update_cell(cell.row, 9, status)  # Status column
+                ws.update_cell(cell.row, 10, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        except Exception as e:
+            log.error(f"Failed to update lead: {e}")
 
-    except Exception as e:
-        log.warning(f"Scrape error for {url}: {e}")
+    def log_outreach(self, lead_id: str, email: str, email_type: str, subject: str):
+        """Log an outreach email."""
+        try:
+            ws = self.sheet.worksheet("Outreach Log")
+            ws.append_row([
+                lead_id, email, email_type, subject,
+                "Sent", datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "No", "No", ""
+            ])
+        except Exception as e:
+            log.error(f"Failed to log outreach: {e}")
 
-    return result
+    def schedule_followup(self, lead_id: str, email: str, followup_num: int, days_later: int, content: str):
+        """Schedule a follow-up email."""
+        try:
+            ws = self.sheet.worksheet("Follow-ups")
+            scheduled = (datetime.now() + timedelta(days=days_later)).strftime("%Y-%m-%d")
+            ws.append_row([
+                lead_id, email, followup_num,
+                scheduled, "Pending", "", content
+            ])
+        except Exception as e:
+            log.error(f"Failed to schedule follow-up: {e}")
 
-# ── GOOGLE SEARCH ────────────────────────────────────────────────
-async def search_companies(niche: str, region: str, count: int) -> list:
-    """Search Google for companies in a niche and region."""
-    queries = [
-        f"{niche} companies in {region}",
-        f"top {niche} brands {region}",
-        f"{niche} business {region} contact",
-    ]
-    websites = []
+    def get_pending_followups(self) -> list:
+        """Get follow-ups due today or overdue."""
+        try:
+            ws = self.sheet.worksheet("Follow-ups")
+            records = ws.get_all_records()
+            today = datetime.now().strftime("%Y-%m-%d")
+            return [
+                r for r in records
+                if r.get("Status") == "Pending" and r.get("Scheduled Date", "") <= today
+            ]
+        except Exception as e:
+            log.error(f"Failed to get follow-ups: {e}")
+            return []
 
-    if SERPAPI_KEY:
-        # Use SerpAPI for real Google results
-        async with httpx.AsyncClient(timeout=15) as client:
-            for query in queries[:2]:
-                try:
-                    resp = await client.get(
-                        "https://serpapi.com/search",
-                        params={"q": query, "api_key": SERPAPI_KEY, "num": 10}
-                    )
-                    data = resp.json()
-                    for result in data.get("organic_results", []):
-                        link = result.get("link", "")
-                        if link and "http" in link:
-                            domain = urlparse(link).netloc
-                            if not any(skip in domain for skip in
-                                      ["google", "facebook", "linkedin", "wikipedia",
-                                       "youtube", "twitter", "instagram"]):
-                                websites.append({
-                                    "url": f"https://{domain}",
-                                    "name": result.get("title", domain),
-                                    "snippet": result.get("snippet", "")
-                                })
-                except Exception as e:
-                    log.warning(f"SerpAPI error: {e}")
-    else:
-        # Fallback: use Claude to generate company list with websites
-        pass
+    def mark_followup_sent(self, lead_id: str, followup_num: int):
+        """Mark a follow-up as sent."""
+        try:
+            ws = self.sheet.worksheet("Follow-ups")
+            records = ws.get_all_records()
+            for i, r in enumerate(records, start=2):
+                if str(r.get("Lead ID")) == str(lead_id) and str(r.get("Follow-up #")) == str(followup_num):
+                    ws.update_cell(i, 5, "Sent")
+                    ws.update_cell(i, 6, datetime.now().strftime("%Y-%m-%d %H:%M"))
+                    break
+        except Exception as e:
+            log.error(f"Failed to mark follow-up: {e}")
 
-    return websites[:count]
+    def get_all_leads_count(self) -> dict:
+        """Get lead counts by status."""
+        try:
+            ws = self.sheet.worksheet("Leads")
+            records = ws.get_all_records()
+            counts = {}
+            for r in records:
+                s = r.get("Status", "Unknown")
+                counts[s] = counts.get(s, 0) + 1
+            counts["Total"] = len(records)
+            return counts
+        except Exception as e:
+            log.error(f"Failed to get counts: {e}")
+            return {"Total": 0}
 
-# ── MAIN RESEARCH ENGINE ─────────────────────────────────────────
-async def full_research(niche: str, region: str, count: int, update: Update) -> list:
-    """
-    Full autonomous research pipeline:
-    1. Find companies via AI + web search
-    2. Scrape each website for real contacts
-    3. Return enriched contact list
-    """
 
-    # Step 1: Get company list from Claude AI
-    await update.message.reply_text(f"🔍 *Step 1/4* — Finding {count} {niche} companies in {region}...", parse_mode="Markdown")
+# ═══════════════════════════════════════════════════════════
+#  LEAD FINDER - Multi-source contact search
+# ═══════════════════════════════════════════════════════════
+class LeadFinder:
+    """Finds business contacts from Apollo, Hunter, and SerpAPI."""
 
-    company_prompt = f"""Find {count} real {niche} companies based in {region}.
+    def __init__(self):
+        self.http = httpx.AsyncClient(timeout=30)
 
-For each company return ONLY a JSON array with:
-- company_name: Real company name
-- website: Their actual website URL (must start with https://)
-- description: One line about what they do
-- decision_maker: Likely job title of person to contact (CMO, Marketing Director, CEO, Brand Manager)
-- linkedin_search: Search phrase to find the right person on LinkedIn
+    async def find_leads(self, industry: str, location: str, count: int = 50) -> list:
+        """Search all sources and merge results."""
+        leads = []
 
-Only include real companies with actual websites. No aggregators, no directories.
-Return ONLY the JSON array, nothing else."""
+        # Run all sources in parallel
+        tasks = []
+        if APOLLO_API_KEY:
+            tasks.append(self._search_apollo(industry, location, count))
+        if HUNTER_API_KEY:
+            tasks.append(self._search_hunter(industry, location, count))
+        if SERPAPI_KEY:
+            tasks.append(self._search_serpapi(industry, location, count))
 
-    try:
-        msg = ai.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4000,
-            messages=[{"role": "user", "content": company_prompt}]
-        )
-        raw = msg.content[0].text.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        companies = json.loads(raw)[:count]
-    except Exception as e:
-        log.error(f"Company research error: {e}")
-        companies = []
+        if not tasks:
+            log.warning("No API keys configured for lead finding!")
+            return []
 
-    if not companies:
-        return []
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, list):
+                leads.extend(result)
 
-    await update.message.reply_text(
-        f"✅ Found *{len(companies)} companies*\n\n"
-        f"🔍 *Step 2/4* — Scraping websites for real contact emails...",
-        parse_mode="Markdown"
-    )
+        # Deduplicate by email
+        seen_emails = set()
+        unique_leads = []
+        for lead in leads:
+            email = lead.get("email", "").lower()
+            if email and email not in seen_emails:
+                seen_emails.add(email)
+                unique_leads.append(lead)
 
-    # Step 2: Scrape each website
-    enriched = []
-    scrape_tasks = []
-    for company in companies:
-        url = company.get("website", "")
-        if url and url.startswith("http"):
-            scrape_tasks.append(scrape_website(url))
-        else:
-            scrape_tasks.append(asyncio.coroutine(lambda: {"emails": [], "phones": []})())
+        return unique_leads[:count]
 
-    scrape_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
-
-    await update.message.reply_text(
-        f"✅ Websites scraped\n\n"
-        f"🤖 *Step 3/4* — AI extracting decision maker details...",
-        parse_mode="Markdown"
-    )
-
-    # Step 3: Use Claude to extract/enrich contact info
-    for i, (company, scraped) in enumerate(zip(companies, scrape_results)):
-        if isinstance(scraped, Exception):
-            scraped = {"emails": [], "phones": []}
-
-        emails = scraped.get("emails", []) if isinstance(scraped, dict) else []
-        phones = scraped.get("phones", []) if isinstance(scraped, dict) else []
-        raw_text = scraped.get("raw_text", "") if isinstance(scraped, dict) else ""
-
-        # Use Claude to extract decision maker from scraped content
-        if raw_text:
-            extract_prompt = f"""From this website content of {company.get('company_name')}, extract:
-1. The name of the most senior marketing/brand decision maker (CMO, Marketing Director, CEO, Brand Manager)
-2. Any direct email for that person
-
-Website content (first 3000 chars):
-{raw_text[:3000]}
-
-Return ONLY JSON: {{"name": "...", "email": "...", "position": "..."}}
-If not found return: {{"name": "", "email": "", "position": "{company.get('decision_maker', 'Marketing Director')}"}}"""
-
-            try:
-                extract_msg = ai.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=200,
-                    messages=[{"role": "user", "content": extract_prompt}]
-                )
-                extracted = json.loads(extract_msg.content[0].text.strip())
-            except Exception:
-                extracted = {"name": "", "email": "", "position": company.get("decision_maker", "")}
-        else:
-            extracted = {"name": "", "email": "", "position": company.get("decision_maker", "")}
-
-        # Pick best email
-        best_email = extracted.get("email") or (emails[0] if emails else "Search")
-
-        enriched.append({
-            "company_name":    company.get("company_name", ""),
-            "website":         company.get("website", ""),
-            "contact_name":    extracted.get("name", ""),
-            "first_name":      extracted.get("name", "").split()[0] if extracted.get("name") else "there",
-            "position":        extracted.get("position", company.get("decision_maker", "")),
-            "email":           best_email,
-            "backup_emails":   ", ".join(emails[1:3]) if len(emails) > 1 else "",
-            "phone":           phones[0].strip() if phones else "",
-            "linkedin_search": company.get("linkedin_search", ""),
-            "description":     company.get("description", ""),
-            "region":          region,
-            "status":          "Pending",
-            "date_added":      datetime.now().strftime("%Y-%m-%d"),
-        })
-
-    return enriched
-
-# ── EMAIL TEMPLATES ──────────────────────────────────────────────
-def get_email_body(template: str, calendly: str) -> dict:
-    templates = {
-        "a": {
-            "subject": "Quick question for {{First Name}}",
-            "body": f"Hi {{{{First Name}}}},\n\nWhat would {{{{Company}}}}'s content look like if it actually stopped people mid-scroll?\n\nI'm Rohit from InfluNexus — we create cinematic video, AI visuals, and CGI/VFX for brands across UAE, India & UK. Past clients include ADCB Bank.\n\nSee our work: https://www.instagram.com/influnexus\n\nBook a quick 15-min call: {calendly}\n\nRohit | InfluNexus\ninfo@influnexus.com\n\n---\n{{{{unsubscribe}}}}"
-        },
-        "b": {
-            "subject": "Content that converts — for {{Company}}",
-            "body": f"Hi {{{{First Name}}}},\n\nMost brand content gets scrolled past in 2 seconds. Ours doesn't.\n\nI'm Rohit, Founder of InfluNexus. We create cinematic video, AI visuals, and digital campaigns for brands like {{{{Company}}}} — UAE, India & UK. Including ADCB Bank.\n\nOur work: https://www.instagram.com/influnexus\n\nPick a time to chat: {calendly}\n\nRohit | InfluNexus\ninfo@influnexus.com\n\n---\n{{{{unsubscribe}}}}"
-        },
-        "c": {
-            "subject": "{{First Name}} — saw {{Company}}, had to reach out",
-            "body": f"Hi {{{{First Name}}}},\n\nLove what {{{{Company}}}} is building.\n\nWe create cinematic brand content — video, AI visuals, CGI — for brands expanding across UAE, India & UK. ADCB Bank is one of our clients.\n\nhttps://www.instagram.com/influnexus\n\n15 mins? {calendly}\n\nRohit | InfluNexus\ninfo@influnexus.com\n\n---\n{{{{unsubscribe}}}}"
-        },
-        "d": {
-            "subject": "Are {{Company}}'s visuals matching your brand quality?",
-            "body": f"Hi {{{{First Name}}}},\n\nGreat brands often have one problem — content that doesn't match the quality of what they've built.\n\nAt InfluNexus we fix that. Cinematic video, AI visuals, CGI/VFX across UAE, India & UK.\n\nSee the work: https://www.instagram.com/influnexus\n\nHappy to share a reel specific to {{{{Company}}}}'s space: {calendly}\n\nRohit | InfluNexus\ninfo@influnexus.com\n\n---\n{{{{unsubscribe}}}}"
-        }
-    }
-    return templates.get(template, templates["c"])
-
-# ── GMASS ────────────────────────────────────────────────────────
-async def launch_gmass(tab: str, template: str, follow_up: bool = True) -> dict:
-    if not GMASS_API_KEY:
-        return {"status": "error", "message": "Add GMASS_API_KEY to Railway environment variables."}
-
-    tpl        = get_email_body(template, CALENDLY_LINK)
-    sheet_url  = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?sheet={tab}"
-
-    payload = {
-        "spreadsheet_url": sheet_url,
-        "subject":         tpl["subject"],
-        "body":            tpl["body"],
-        "from_name":       "Rohit | InfluNexus",
-        "reply_to":        "info@influnexus.com",
-        "track_opens":     False,
-        "track_clicks":    False,
-        "emails_per_day":  80,
-        "schedule_type":   "now",
-    }
-
-    if follow_up:
-        payload["follow_ups"] = [
-            {
-                "days_after": 3,
-                "subject":    "Following up — {{Company}}",
-                "body":       f"Hi {{{{First Name}}}},\n\nJust following up on my last message — wanted to make sure it didn't get buried.\n\nWould love to show you what we've done for brands in your space.\n\nQuick call? {CALENDLY_LINK}\n\nRohit | InfluNexus"
-            },
-            {
-                "days_after": 7,
-                "subject":    "Last note — InfluNexus x {{Company}}",
-                "body":       f"Hi {{{{First Name}}}},\n\nLast message from me — I know inboxes get busy.\n\nIf the timing isn't right, no worries at all. But if you'd ever like to explore what we could create for {{{{Company}}}}, I'm here.\n\n{CALENDLY_LINK}\n\nRohit | InfluNexus"
+    async def _search_apollo(self, industry: str, location: str, count: int) -> list:
+        """Search Apollo.io for contacts."""
+        leads = []
+        try:
+            # Apollo People Search API
+            url = "https://api.apollo.io/v1/mixed_people/search"
+            payload = {
+                "api_key": APOLLO_API_KEY,
+                "q_organization_keyword_tags": [industry],
+                "person_locations": [location],
+                "page": 1,
+                "per_page": min(count, 100),
+                "person_seniorities": ["director", "vp", "c_suite", "owner", "founder"],
             }
-        ]
+            resp = await self.http.post(url, json=payload)
+            data = resp.json()
 
+            for person in data.get("people", []):
+                email = person.get("email") or ""
+                if not email:
+                    continue
+                leads.append({
+                    "company": person.get("organization", {}).get("name", ""),
+                    "contact_name": person.get("name", ""),
+                    "email": email,
+                    "phone": person.get("phone_numbers", [{}])[0].get("sanitized_number", "") if person.get("phone_numbers") else "",
+                    "industry": industry,
+                    "location": location,
+                    "source": "Apollo.io",
+                    "title": person.get("title", ""),
+                    "linkedin": person.get("linkedin_url", ""),
+                    "company_website": person.get("organization", {}).get("website_url", ""),
+                    "notes": f"Title: {person.get('title', 'N/A')}"
+                })
+
+            log.info(f"Apollo returned {len(leads)} leads")
+        except Exception as e:
+            log.error(f"Apollo search failed: {e}")
+        return leads
+
+    async def _search_hunter(self, industry: str, location: str, count: int) -> list:
+        """Search Hunter.io for emails by domain."""
+        leads = []
+        try:
+            # First search for companies via domain search
+            search_url = "https://api.hunter.io/v2/domain-search"
+            # Use SerpAPI to find company domains first, then Hunter for emails
+            if SERPAPI_KEY:
+                domains = await self._find_domains_via_serp(industry, location)
+                for domain_info in domains[:min(count, 20)]:
+                    domain = domain_info.get("domain", "")
+                    if not domain:
+                        continue
+                    try:
+                        resp = await self.http.get(search_url, params={
+                            "domain": domain,
+                            "api_key": HUNTER_API_KEY,
+                            "type": "personal",
+                            "seniority": "senior,executive",
+                            "limit": 5
+                        })
+                        data = resp.json()
+                        for email_data in data.get("data", {}).get("emails", []):
+                            leads.append({
+                                "company": data.get("data", {}).get("organization", domain_info.get("company", "")),
+                                "contact_name": f"{email_data.get('first_name', '')} {email_data.get('last_name', '')}".strip(),
+                                "email": email_data.get("value", ""),
+                                "phone": email_data.get("phone_number", "") or "",
+                                "industry": industry,
+                                "location": location,
+                                "source": "Hunter.io",
+                                "title": email_data.get("position", ""),
+                                "notes": f"Confidence: {email_data.get('confidence', 'N/A')}%"
+                            })
+                    except Exception as e:
+                        log.error(f"Hunter domain search for {domain} failed: {e}")
+
+            log.info(f"Hunter returned {len(leads)} leads")
+        except Exception as e:
+            log.error(f"Hunter search failed: {e}")
+        return leads
+
+    async def _find_domains_via_serp(self, industry: str, location: str) -> list:
+        """Find company domains via Google search."""
+        domains = []
+        try:
+            query = f"{industry} companies in {location} contact email"
+            resp = await self.http.get("https://serpapi.com/search.json", params={
+                "api_key": SERPAPI_KEY,
+                "q": query,
+                "num": 50,
+                "engine": "google"
+            })
+            data = resp.json()
+            for result in data.get("organic_results", []):
+                link = result.get("link", "")
+                title = result.get("title", "")
+                # Extract domain
+                if link:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(link)
+                    domain = parsed.netloc.replace("www.", "")
+                    if domain and not any(x in domain for x in [
+                        "linkedin.com", "facebook.com", "twitter.com",
+                        "instagram.com", "youtube.com", "wikipedia.org",
+                        "yelp.com", "crunchbase.com", "google.com"
+                    ]):
+                        domains.append({
+                            "domain": domain,
+                            "company": title
+                        })
+        except Exception as e:
+            log.error(f"SerpAPI domain search failed: {e}")
+        return domains
+
+    async def _search_serpapi(self, industry: str, location: str, count: int) -> list:
+        """Search Google via SerpAPI for business contact info."""
+        leads = []
+        try:
+            queries = [
+                f"{industry} companies in {location} email contact",
+                f"top {industry} firms {location} CEO email",
+                f"{industry} {location} business directory email",
+            ]
+            for query in queries:
+                resp = await self.http.get("https://serpapi.com/search.json", params={
+                    "api_key": SERPAPI_KEY,
+                    "q": query,
+                    "num": 20,
+                    "engine": "google"
+                })
+                data = resp.json()
+
+                for result in data.get("organic_results", []):
+                    snippet = result.get("snippet", "")
+                    title = result.get("title", "")
+                    link = result.get("link", "")
+
+                    # Extract emails from snippets
+                    emails_found = re.findall(
+                        r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+                        snippet
+                    )
+
+                    for email in emails_found:
+                        if not any(x in email.lower() for x in [
+                            "example.com", "email.com", "test.com", "sentry"
+                        ]):
+                            leads.append({
+                                "company": title.split("-")[0].split("|")[0].strip()[:60],
+                                "contact_name": "",
+                                "email": email,
+                                "phone": "",
+                                "industry": industry,
+                                "location": location,
+                                "source": "SerpAPI/Google",
+                                "notes": f"Found via: {link[:80]}"
+                            })
+
+                # Also check local results
+                for result in data.get("local_results", []):
+                    if result.get("email"):
+                        leads.append({
+                            "company": result.get("title", ""),
+                            "contact_name": "",
+                            "email": result.get("email", ""),
+                            "phone": result.get("phone", ""),
+                            "industry": industry,
+                            "location": location,
+                            "source": "SerpAPI/Google Local",
+                            "notes": f"Rating: {result.get('rating', 'N/A')}"
+                        })
+
+            log.info(f"SerpAPI returned {len(leads)} leads")
+        except Exception as e:
+            log.error(f"SerpAPI search failed: {e}")
+        return leads
+
+    async def verify_email(self, email: str) -> dict:
+        """Verify an email using Hunter.io."""
+        if not HUNTER_API_KEY:
+            return {"status": "unknown", "score": 0}
+        try:
+            resp = await self.http.get("https://api.hunter.io/v2/email-verifier", params={
+                "email": email,
+                "api_key": HUNTER_API_KEY
+            })
+            data = resp.json().get("data", {})
+            return {
+                "status": data.get("status", "unknown"),
+                "score": data.get("score", 0)
+            }
+        except Exception:
+            return {"status": "unknown", "score": 0}
+
+    async def close(self):
+        await self.http.aclose()
+
+
+# ═══════════════════════════════════════════════════════════
+#  EMAIL ENGINE - GMass bulk + SMTP follow-ups
+# ═══════════════════════════════════════════════════════════
+class EmailEngine:
+    """Handles all email sending — GMass for bulk, SMTP for follow-ups."""
+
+    def __init__(self):
+        self.claude = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+
+    def generate_email(self, lead: dict, email_type: str = "initial") -> dict:
+        """Use Claude to generate a personalized email."""
+        if email_type == "initial":
+            prompt = f"""Write a professional, warm, and personalized cold outreach email from Rohit at InfluNexus.
+
+Lead Info:
+- Company: {lead.get('company', 'Unknown')}
+- Contact: {lead.get('contact_name', 'there')}
+- Industry: {lead.get('industry', 'their industry')}
+- Location: {lead.get('location', '')}
+- Title: {lead.get('title', '')}
+- Company Website: {lead.get('company_website', '')}
+
+About InfluNexus:
+{INFLUNEXUS_PITCH}
+
+Guidelines:
+- Keep it under 150 words
+- Be warm and genuine, NOT salesy
+- Reference something specific about their industry
+- Show how InfluNexus can add value to THEIR specific business
+- End with a soft CTA (suggest a quick call or meeting)
+- Include the Calendly link: {CALENDLY_LINK}
+- Sign off as: Rohit | Founder, InfluNexus | {COMPANY_WEBSITE}
+
+Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
+
+        elif email_type == "followup_1":
+            prompt = f"""Write a follow-up email (1st follow-up, 3 days after initial outreach) from Rohit at InfluNexus.
+
+Lead: {lead.get('contact_name', 'there')} at {lead.get('company', 'their company')}
+Industry: {lead.get('industry', '')}
+
+Guidelines:
+- Very short (under 80 words)
+- Reference the previous email naturally
+- Add one new value point or recent work example
+- Keep the tone friendly and non-pushy
+- Include Calendly: {CALENDLY_LINK}
+- Sign off as: Rohit | InfluNexus
+
+Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
+
+        elif email_type == "followup_2":
+            prompt = f"""Write a 2nd follow-up email (7 days after initial outreach) from Rohit at InfluNexus.
+
+Lead: {lead.get('contact_name', 'there')} at {lead.get('company', 'their company')}
+Industry: {lead.get('industry', '')}
+
+Guidelines:
+- Ultra short (under 60 words)
+- Friendly breakup-style email ("Just checking if this is on your radar")
+- Mention one specific thing you could do for them
+- Last gentle nudge with Calendly: {CALENDLY_LINK}
+- Sign off as: Rohit | InfluNexus
+
+Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
+
+        else:
+            return {"subject": "InfluNexus - Creative & AI Production", "body": "Hi there"}
+
+        try:
+            response = self.claude.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = response.content[0].text.strip()
+            # Clean up potential markdown
+            text = re.sub(r'^```json\s*', '', text)
+            text = re.sub(r'\s*```$', '', text)
+            return json.loads(text)
+        except Exception as e:
+            log.error(f"Claude email generation failed: {e}")
+            return {
+                "subject": f"Creative & AI Production for {lead.get('company', 'your brand')} — InfluNexus",
+                "body": f"Hi {lead.get('contact_name', 'there')},\n\nI'm Rohit from InfluNexus — we're a creative & AI production agency working across UAE, India, and the UK.\n\nI'd love to explore how we could support {lead.get('company', 'your brand')} with premium video, AI visuals, or digital campaigns.\n\nWould you be open to a quick 15-min chat?\n\nBook a time: {CALENDLY_LINK}\n\nBest,\nRohit\nFounder, InfluNexus\n{COMPANY_WEBSITE}"
+            }
+
+    async def send_via_gmass(self, leads: list, email_data: dict) -> dict:
+        """Send bulk emails via GMass API."""
+        if not GMASS_API_KEY:
+            return {"success": False, "error": "GMass API key not configured"}
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                # GMass campaign creation
+                recipients = []
+                for lead in leads:
+                    recipients.append({
+                        "EmailAddress": lead.get("email", ""),
+                        "Name": lead.get("contact_name", ""),
+                        "Company": lead.get("company", ""),
+                    })
+
+                payload = {
+                    "apiKey": GMASS_API_KEY,
+                    "subject": email_data["subject"],
+                    "message": email_data["body"],
+                    "recipients": recipients,
+                    "openTracking": True,
+                    "clickTracking": True,
+                    "sendAs": SMTP_EMAIL
+                }
+
+                resp = await client.post(
+                    "https://api.gmass.co/api/campaigns",
+                    json=payload
+                )
+
+                if resp.status_code == 200:
+                    return {"success": True, "data": resp.json()}
+                else:
+                    log.error(f"GMass error: {resp.text}")
+                    return {"success": False, "error": resp.text}
+        except Exception as e:
+            log.error(f"GMass send failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def send_via_smtp(self, to_email: str, subject: str, body: str) -> bool:
+        """Send a single email via Google Workspace SMTP."""
+        if not SMTP_PASSWORD:
+            log.error("SMTP password not configured")
+            return False
+
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["From"] = f"Rohit | InfluNexus <{SMTP_EMAIL}>"
+            msg["To"] = to_email
+            msg["Subject"] = subject
+
+            # HTML version
+            html_body = body.replace("\n", "<br>")
+            html = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
+                {html_body}
+            </body>
+            </html>
+            """
+
+            msg.attach(MIMEText(body, "plain"))
+            msg.attach(MIMEText(html, "html"))
+
+            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                server.starttls()
+                server.login(SMTP_EMAIL, SMTP_PASSWORD)
+                server.send_message(msg)
+
+            log.info(f"SMTP email sent to {to_email}")
+            return True
+        except Exception as e:
+            log.error(f"SMTP send failed to {to_email}: {e}")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  MEETING BOOKER - Google Calendar + Meet
+# ═══════════════════════════════════════════════════════════
+class MeetingBooker:
+    """Books meetings with Google Meet links."""
+
+    def __init__(self):
+        try:
+            creds_dict = json.loads(GOOGLE_CREDS_JSON)
+            scope = [
+                "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/calendar.events"
+            ]
+            self.creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        except Exception as e:
+            log.error(f"Calendar auth failed: {e}")
+            self.creds = None
+
+    async def create_meeting(self, attendee_email: str, attendee_name: str, 
+                              date_str: str, time_str: str = "10:00") -> dict:
+        """Create a Google Calendar event with Meet link."""
+        if not self.creds:
+            return {"success": False, "error": "Calendar not configured"}
+
+        try:
+            import google.auth.transport.requests
+            from googleapiclient.discovery import build
+
+            service = build("calendar", "v3", credentials=self.creds)
+
+            start_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+            end_dt = start_dt + timedelta(minutes=30)
+
+            event = {
+                "summary": f"InfluNexus x {attendee_name} — Intro Call",
+                "description": f"Quick intro call to discuss how InfluNexus can help.\n\n{COMPANY_WEBSITE}",
+                "start": {
+                    "dateTime": start_dt.isoformat(),
+                    "timeZone": "Asia/Dubai"
+                },
+                "end": {
+                    "dateTime": end_dt.isoformat(),
+                    "timeZone": "Asia/Dubai"
+                },
+                "attendees": [
+                    {"email": attendee_email},
+                    {"email": SMTP_EMAIL}
+                ],
+                "conferenceData": {
+                    "createRequest": {
+                        "requestId": hashlib.md5(attendee_email.encode()).hexdigest(),
+                        "conferenceSolutionKey": {"type": "hangoutsMeet"}
+                    }
+                },
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [
+                        {"method": "email", "minutes": 60},
+                        {"method": "popup", "minutes": 15}
+                    ]
+                }
+            }
+
+            result = service.events().insert(
+                calendarId=GCAL_CALENDAR_ID,
+                body=event,
+                conferenceDataVersion=1,
+                sendUpdates="all"
+            ).execute()
+
+            meet_link = result.get("hangoutLink", "")
+            return {
+                "success": True,
+                "event_link": result.get("htmlLink", ""),
+                "meet_link": meet_link,
+                "event_id": result.get("id", "")
+            }
+        except Exception as e:
+            log.error(f"Meeting creation failed: {e}")
+            return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════
+#  TELEGRAM BOT HANDLERS
+# ═══════════════════════════════════════════════════════════
+
+# Initialize components
+crm = CRM()
+lead_finder = LeadFinder()
+email_engine = EmailEngine()
+meeting_booker = MeetingBooker()
+
+
+def auth_check(func):
+    """Decorator to restrict bot to allowed user."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+            await update.message.reply_text("⛔ Unauthorized. This bot is private.")
+            return ConversationHandler.END
+        return await func(update, context)
+    return wrapper
+
+
+@auth_check
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome message with main menu."""
+    keyboard = ReplyKeyboardMarkup([
+        ["🔍 Find Leads", "📧 Run Outreach"],
+        ["📊 CRM Dashboard", "📅 Book Meeting"],
+        ["🔄 Send Follow-ups", "🤖 AI Chat"],
+    ], resize_keyboard=True)
+
+    await update.message.reply_text(
+        "🚀 *InfluNexus Sales Agent Bot v4*\n\n"
+        "I'm your autonomous sales agent. Here's what I can do:\n\n"
+        "🔍 *Find Leads* — Search any industry/location for contacts\n"
+        "📧 *Run Outreach* — Auto-send personalized emails\n"
+        "📊 *CRM Dashboard* — View all leads & stats\n"
+        "📅 *Book Meeting* — Schedule calls with Google Meet\n"
+        "🔄 *Send Follow-ups* — Process pending follow-ups\n"
+        "🤖 *AI Chat* — Ask me anything about sales strategy\n\n"
+        "Let's get started! 👇",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
+# ─── Lead Search Flow ─────────────────────────────────────
+@auth_check
+async def cmd_find_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the lead search flow."""
+    await update.message.reply_text(
+        "🔍 *Lead Search*\n\nWhat industry/niche are you targeting?\n\n"
+        "Examples: shoes, real estate, jewelry, fashion, restaurants, tech startups",
+        parse_mode="Markdown"
+    )
+    return SEARCH_INDUSTRY
+
+
+async def handle_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["search_industry"] = update.message.text
+    await update.message.reply_text(
+        "📍 Which location/city?\n\n"
+        "Examples: Dubai, Mumbai, London, New York, Riyadh"
+    )
+    return SEARCH_LOCATION
+
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["search_location"] = update.message.text
+    await update.message.reply_text(
+        "🔢 How many leads do you need?\n\n"
+        "Enter a number (e.g., 50, 100, 500)"
+    )
+    return SEARCH_COUNT
+
+
+async def handle_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            resp = await c.post(
-                "https://api.gmass.co/api/campaigns",
-                headers={"Authorization": f"Bearer {GMASS_API_KEY}", "Content-Type": "application/json"},
-                json=payload
-            )
-        if resp.status_code == 200:
-            return {"status": "success", "campaign_id": resp.json().get("id")}
-        return {"status": "error", "message": f"GMass {resp.status_code}: {resp.text[:300]}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        count = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Please enter a valid number.")
+        return SEARCH_COUNT
 
-# ── SECURITY ─────────────────────────────────────────────────────
-def is_auth(update: Update) -> bool:
-    if ALLOWED_USER_ID == 0: return True
-    return update.effective_user.id == ALLOWED_USER_ID
-
-def tab_name(region: str, niche: str) -> str:
-    r = re.sub(r'[^a-zA-Z0-9]', '_', region)[:8]
-    n = re.sub(r'[^a-zA-Z0-9]', '_', niche)[:8]
-    return f"{r}_{n}_{datetime.now().strftime('%b%d')}"
-
-def upd_stats(ctx, **kw):
-    s = ctx.bot_data.get("stats", {"lists": 0, "contacts": 0, "campaigns": 0, "emails_found": 0})
-    for k, v in kw.items(): s[k] = s.get(k, 0) + v
-    ctx.bot_data["stats"] = s
-
-# ── COMMAND HANDLERS ─────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_auth(update): return
-    await update.message.reply_text(
-        "👋 *InfluNexus Autonomous Agent v3*\n\n"
-        "Just tell me what you need — I do everything:\n\n"
-        "🔍 Find companies\n"
-        "🌐 Scrape their websites\n"
-        "📧 Extract real emails\n"
-        "📊 Upload to Google Sheet + CSV\n"
-        "🚀 Launch email campaign\n"
-        "🔄 Auto follow-up (Day 3 + Day 7)\n"
-        "📅 Calendly booking link in every email\n\n"
-        "*Just type:*\n"
-        "`shoes companies in Dubai 20`\n"
-        "`jewellery brands in Switzerland 15`\n"
-        "`real estate developers in Qatar 25`\n\n"
-        "Or use commands:\n"
-        "`/run <niche> in <region> <count>` — full pipeline\n"
-        "`/find <niche> in <region> <count>` — find only, no campaign\n"
-        "`/send <TabName> <a|b|c|d>` — send to existing list\n"
-        "`/results` — campaign stats\n"
-        "`/status` — today's summary\n"
-        "`/sheet` — open Google Sheet\n"
-        "`/help` — full guide",
-        parse_mode="Markdown"
-    )
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_auth(update): return
-    await update.message.reply_text(
-        "📖 *Full Command Guide*\n\n"
-        "*Full pipeline (find + scrape + send):*\n"
-        "`/run shoes companies in Dubai 20`\n"
-        "`/run jewellery brands in Switzerland 15`\n"
-        "`/run real estate developers in Qatar 30`\n\n"
-        "*Find only (no campaign):*\n"
-        "`/find sports brands in UAE 25`\n"
-        "Builds list, uploads to sheet, you review before sending\n\n"
-        "*Send to existing list:*\n"
-        "`/send Dubai_shoes_Mar17 c`\n"
-        "Templates: a=Curiosity | b=Value | c=Punchy | d=Problem\n\n"
-        "*Results:*\n"
-        "`/results` — open/click/reply rates for all campaigns\n\n"
-        "*Natural language:*\n"
-        "Just type normally — bot understands:\n"
-        "'shoes companies in dubai'\n"
-        "'find me 30 jewellery brands in switzerland'\n"
-        "'sports companies from qatar region'\n\n"
-        "*All runs automatically include:*\n"
-        "✅ Website scraping for real emails\n"
-        "✅ Decision maker extraction\n"
-        "✅ Google Sheet upload\n"
-        "✅ CSV download link\n"
-        "✅ GMass campaign launch\n"
-        "✅ Day 3 + Day 7 follow-ups\n"
-        "✅ Calendly booking link",
-        parse_mode="Markdown"
-    )
-
-async def run_full_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE, niche: str, region: str, count: int, send_campaign: bool = True):
-    """Core pipeline — find, scrape, upload, send."""
-    tname = tab_name(region, niche)
+    context.user_data["search_count"] = count
+    industry = context.user_data["search_industry"]
+    location = context.user_data["search_location"]
 
     await update.message.reply_text(
-        f"🤖 *InfluNexus Agent — Starting full pipeline*\n\n"
-        f"Niche: *{niche}*\n"
-        f"Region: *{region}*\n"
-        f"Target: *{count} companies*\n\n"
-        f"This takes 2–3 minutes. I'll update you at each step 👇",
+        f"⏳ Searching for *{count}* leads in *{industry}* across *{location}*...\n\n"
+        "This may take a minute. Searching Apollo, Hunter, and Google...",
         parse_mode="Markdown"
     )
 
-    # Run full research
-    contacts = await full_research(niche, region, count, update)
+    # Search for leads
+    leads = await lead_finder.find_leads(industry, location, count)
 
-            # Fallback search if first attempt fails
-        if not contacts:
-            relaxed_niche = " ".join([w for w in niche.split() if w.lower() not in ["from","in","at","the"]])
-            contacts = await full_research(relaxed_niche, region, count, update)
-
-        if not contacts:
-            await update.message.reply_text(
-                "❌ Research failed.\n\n💡 Try:\n• `/run dental clinic Dubai 5`\n• Use simpler niche\n• Try smaller count like 5",
-                parse_mode="Markdown"
-            )
-            return
-
-
-    emails_found = sum(1 for c in contacts if c["email"] != "Search")
-
-    await update.message.reply_text(
-        f"✅ *Step 3/4 done* — {len(contacts)} companies researched\n"
-        f"📧 Real emails found: *{emails_found}/{len(contacts)}*\n\n"
-        f"📊 *Step 4/4* — Uploading to Google Sheet...",
-        parse_mode="Markdown"
-    )
-
-    # Upload to sheet
-    headers = [
-        "First Name", "Company", "Website", "Contact Name", "Position",
-        "Email", "Backup Emails", "Phone", "LinkedIn Search",
-        "Description", "Region", "Status", "Date Added"
-    ]
-    rows = [[
-        c["first_name"], c["company_name"], c["website"], c["contact_name"],
-        c["position"], c["email"], c["backup_emails"], c["phone"],
-        c["linkedin_search"], c["description"], c["region"],
-        c["status"], c["date_added"]
-    ] for c in contacts]
-
-    sheet_url = write_sheet(tname, headers, rows)
-    csv_bytes  = make_csv(headers, rows)
-    upd_stats(ctx, lists=1, contacts=len(contacts), emails_found=emails_found)
-
-    # Send CSV file to Telegram
-    await update.message.reply_document(
-        document=io.BytesIO(csv_bytes),
-        filename=f"{tname}.csv",
-        caption=f"📎 *{tname}.csv* — {len(contacts)} contacts",
-        parse_mode="Markdown"
-    )
-
-    if send_campaign:
-        # Launch GMass
-        result = await launch_gmass(tname, "c", follow_up=True)
-        upd_stats(ctx, campaigns=1)
-
-        # Preview first 3
-        preview = ""
-        for c in contacts[:3]:
-            name  = c["contact_name"] or "Decision maker"
-            email = c["email"]
-            preview += f"\n• *{c['company_name']}* — {name} — `{email}`"
-        if len(contacts) > 3:
-            preview += f"\n_...and {len(contacts)-3} more_"
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Open Sheet", url=sheet_url)],
-            [InlineKeyboardButton("📈 View Dashboard", url="https://app.gmass.co/dashboard")],
-            [InlineKeyboardButton("🔁 Run Another", callback_data="new_run")]
-        ])
-
-        campaign_status = "✅ Campaign launched!" if result["status"] == "success" else f"❌ Campaign failed: {result['message']}"
-
+    if not leads:
         await update.message.reply_text(
-            f"🎉 *Pipeline Complete!*\n\n"
-            f"Companies found: *{len(contacts)}*\n"
-            f"Emails extracted: *{emails_found}*\n"
-            f"Sheet tab: `{tname}`\n\n"
-            f"*Sample contacts:*{preview}\n\n"
-            f"📧 *Campaign:* {campaign_status}\n"
-            f"🔄 *Follow-ups:* Day 3 + Day 7 auto-scheduled\n"
-            f"📅 *Calendly:* included in every email\n\n"
-            f"Check results in 48h → `/results`",
-            parse_mode="Markdown",
-            reply_markup=keyboard
+            "😕 No leads found. Try:\n"
+            "- Broader industry terms\n"
+            "- Larger cities\n"
+            "- Check your API keys are set up correctly"
         )
-    else:
-        preview = ""
-        for c in contacts[:3]:
-            preview += f"\n• *{c['company_name']}* — `{c['email']}`"
+        return ConversationHandler.END
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Open Sheet", url=sheet_url)],
-            [InlineKeyboardButton("🚀 Send Campaign Now", callback_data=f"send|{tname}|c")],
-        ])
+    # Store leads in context and CRM
+    context.user_data["found_leads"] = leads
+    added_count = 0
+    for lead in leads:
+        lead_id = crm.add_lead(lead)
+        if lead_id:
+            lead["id"] = lead_id
+            added_count += 1
 
-        await update.message.reply_text(
-            f"✅ *List Ready — No campaign sent yet*\n\n"
-            f"Companies: *{len(contacts)}*\n"
-            f"Emails found: *{emails_found}*\n"
-            f"Tab: `{tname}`\n\n"
-            f"*Preview:*{preview}\n\n"
-            f"Review the sheet then tap *Send Campaign* 👇",
-            parse_mode="Markdown",
-            reply_markup=keyboard
+    # Summary
+    sources = {}
+    for lead in leads:
+        src = lead.get("source", "Unknown")
+        sources[src] = sources.get(src, 0) + 1
+
+    source_text = "\n".join([f"  • {src}: {cnt}" for src, cnt in sources.items()])
+
+    # Show sample leads
+    sample = leads[:5]
+    sample_text = ""
+    for i, lead in enumerate(sample, 1):
+        sample_text += (
+            f"\n{i}. *{lead.get('company', 'N/A')}*\n"
+            f"   👤 {lead.get('contact_name', 'N/A')} — {lead.get('title', 'N/A')}\n"
+            f"   📧 {lead.get('email', 'N/A')}\n"
         )
 
-async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Full pipeline: find + scrape + send."""
-    if not is_auth(update): return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/run shoes companies in Dubai 20`", parse_mode="Markdown")
-        return
-    niche, region, count = parse_args(" ".join(ctx.args))
-    await run_full_pipeline(update, ctx, niche, region, count, send_campaign=True)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📧 Start Outreach to ALL", callback_data="outreach_all")],
+        [InlineKeyboardButton("✅ Done — Save to CRM only", callback_data="save_only")],
+    ])
 
-async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Find only — no campaign sent."""
-    if not is_auth(update): return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/find shoes companies in Dubai 20`", parse_mode="Markdown")
-        return
-    niche, region, count = parse_args(" ".join(ctx.args))
-    await run_full_pipeline(update, ctx, niche, region, count, send_campaign=False)
+    await update.message.reply_text(
+        f"✅ *Found {len(leads)} leads!*\n\n"
+        f"📊 Sources:\n{source_text}\n\n"
+        f"📝 Sample leads:{sample_text}\n\n"
+        f"💾 {added_count} leads saved to Google Sheets CRM.\n\n"
+        "What would you like to do?",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    return CONFIRM_OUTREACH
 
-async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Send campaign to existing sheet tab."""
-    if not is_auth(update): return
-    if len(ctx.args) < 2:
-        await update.message.reply_text("Usage: `/send TabName c`\nTemplates: a b c d", parse_mode="Markdown")
+
+async def handle_outreach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "save_only":
+        await query.edit_message_text("✅ Leads saved to CRM. Use 📧 *Run Outreach* when ready.", parse_mode="Markdown")
+        return ConversationHandler.END
+
+    elif query.data == "outreach_all":
+        leads = context.user_data.get("found_leads", [])
+        if not leads:
+            await query.edit_message_text("No leads found. Run a search first.")
+            return ConversationHandler.END
+
+        await query.edit_message_text(
+            f"📧 *Starting outreach to {len(leads)} leads...*\n\n"
+            "Generating personalized emails with Claude AI...\n"
+            "This may take a few minutes for large batches.",
+            parse_mode="Markdown"
+        )
+
+        # Generate and send emails
+        success_count = 0
+        fail_count = 0
+
+        # For bulk: use GMass if available
+        if GMASS_API_KEY and len(leads) > 10:
+            # Generate a template email for bulk
+            sample_lead = leads[0]
+            email_data = email_engine.generate_email(sample_lead, "initial")
+
+            # Personalize subject with merge tags
+            email_data["subject"] = email_data["subject"].replace(
+                sample_lead.get("company", ""), "{Company}"
+            )
+            email_data["body"] = email_data["body"].replace(
+                sample_lead.get("contact_name", ""), "{Name}"
+            ).replace(
+                sample_lead.get("company", ""), "{Company}"
+            )
+
+            result = await email_engine.send_via_gmass(leads, email_data)
+            if result["success"]:
+                success_count = len(leads)
+                # Log all outreach
+                for lead in leads:
+                    crm.log_outreach(lead.get("id", ""), lead["email"], "Initial - GMass", email_data["subject"])
+                    crm.update_lead_status(lead.get("id", ""), "Contacted")
+                    # Schedule follow-ups
+                    crm.schedule_followup(lead.get("id", ""), lead["email"], 1, 3, "followup_1")
+                    crm.schedule_followup(lead.get("id", ""), lead["email"], 2, 7, "followup_2")
+            else:
+                fail_count = len(leads)
+        else:
+            # SMTP individual sends with personalized emails
+            for lead in leads:
+                email_data = email_engine.generate_email(lead, "initial")
+                sent = email_engine.send_via_smtp(
+                    lead["email"],
+                    email_data["subject"],
+                    email_data["body"]
+                )
+                if sent:
+                    success_count += 1
+                    crm.log_outreach(lead.get("id", ""), lead["email"], "Initial - SMTP", email_data["subject"])
+                    crm.update_lead_status(lead.get("id", ""), "Contacted")
+                    crm.schedule_followup(lead.get("id", ""), lead["email"], 1, 3, "followup_1")
+                    crm.schedule_followup(lead.get("id", ""), lead["email"], 2, 7, "followup_2")
+                else:
+                    fail_count += 1
+                # Rate limiting
+                await asyncio.sleep(2)
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                f"📧 *Outreach Complete!*\n\n"
+                f"✅ Sent: {success_count}\n"
+                f"❌ Failed: {fail_count}\n\n"
+                f"📅 Follow-up 1 scheduled: Day 3\n"
+                f"📅 Follow-up 2 scheduled: Day 7\n\n"
+                "Use 🔄 *Send Follow-ups* to process them when due."
+            ),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+
+# ─── Outreach from CRM ────────────────────────────────────
+@auth_check
+async def cmd_run_outreach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run outreach to new leads in CRM."""
+    new_leads = crm.get_leads_by_status("New")
+
+    if not new_leads:
+        await update.message.reply_text(
+            "📭 No new leads in CRM. Use 🔍 *Find Leads* to add some first.",
+            parse_mode="Markdown"
+        )
         return
-    tname    = ctx.args[0]
-    template = ctx.args[1].lower()
-    status   = await update.message.reply_text(f"🚀 Launching campaign for `{tname}`...", parse_mode="Markdown")
-    result   = await launch_gmass(tname, template, follow_up=True)
-    if result["status"] == "success":
-        upd_stats(ctx, campaigns=1)
-        await status.edit_text(
-            f"✅ *Campaign sent!*\n\nTab: `{tname}`\nFollow-ups: Day 3 + Day 7 ✅\nCalendly: included ✅\n\nCheck `/results` in 48h",
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📧 Email all {len(new_leads)} new leads", callback_data="outreach_crm_all")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_outreach")],
+    ])
+
+    await update.message.reply_text(
+        f"📧 *Outreach Queue*\n\n"
+        f"Found *{len(new_leads)}* new leads ready for outreach.\n\n"
+        "Start emailing them?",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
+async def handle_crm_outreach_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel_outreach":
+        await query.edit_message_text("Outreach cancelled.")
+        return
+
+    if query.data == "outreach_crm_all":
+        new_leads = crm.get_leads_by_status("New")
+        await query.edit_message_text(f"⏳ Sending to {len(new_leads)} leads...")
+
+        success = 0
+        for lead in new_leads:
+            email_data = email_engine.generate_email(lead, "initial")
+            sent = email_engine.send_via_smtp(lead["Email"], email_data["subject"], email_data["body"])
+            if sent:
+                success += 1
+                crm.log_outreach(lead["ID"], lead["Email"], "Initial", email_data["subject"])
+                crm.update_lead_status(lead["ID"], "Contacted")
+                crm.schedule_followup(lead["ID"], lead["Email"], 1, 3, "followup_1")
+                crm.schedule_followup(lead["ID"], lead["Email"], 2, 7, "followup_2")
+            await asyncio.sleep(2)
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"✅ Outreach sent to {success}/{len(new_leads)} leads!"
+        )
+
+
+# ─── Follow-ups ───────────────────────────────────────────
+@auth_check
+async def cmd_followups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process pending follow-ups."""
+    pending = crm.get_pending_followups()
+
+    if not pending:
+        await update.message.reply_text(
+            "✅ No follow-ups due today! All caught up."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔄 Processing *{len(pending)}* pending follow-ups...",
+        parse_mode="Markdown"
+    )
+
+    success = 0
+    for fu in pending:
+        email = fu.get("Email", "")
+        fu_num = fu.get("Follow-up #", 1)
+        lead_id = fu.get("Lead ID", "")
+
+        # Build lead dict for email generation
+        lead = {"email": email, "contact_name": "", "company": "", "industry": ""}
+
+        email_type = "followup_1" if fu_num == 1 else "followup_2"
+        email_data = email_engine.generate_email(lead, email_type)
+
+        sent = email_engine.send_via_smtp(email, email_data["subject"], email_data["body"])
+        if sent:
+            success += 1
+            crm.mark_followup_sent(lead_id, fu_num)
+            crm.log_outreach(lead_id, email, f"Follow-up #{fu_num}", email_data["subject"])
+        await asyncio.sleep(2)
+
+    await update.message.reply_text(
+        f"✅ Follow-ups sent: {success}/{len(pending)}"
+    )
+
+
+# ─── CRM Dashboard ────────────────────────────────────────
+@auth_check
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show CRM dashboard."""
+    counts = crm.get_all_leads_count()
+    pending_fus = crm.get_pending_followups()
+
+    text = (
+        "📊 *InfluNexus CRM Dashboard*\n\n"
+        f"📈 Total Leads: *{counts.get('Total', 0)}*\n"
+        f"🆕 New: {counts.get('New', 0)}\n"
+        f"📧 Contacted: {counts.get('Contacted', 0)}\n"
+        f"🔄 Follow-up: {counts.get('Follow-up', 0)}\n"
+        f"📅 Meeting Booked: {counts.get('Meeting Booked', 0)}\n"
+        f"✅ Won: {counts.get('Won', 0)}\n"
+        f"❌ Lost: {counts.get('Lost', 0)}\n\n"
+        f"🔄 Pending Follow-ups: *{len(pending_fus)}*\n\n"
+        f"📄 [Open Google Sheet](https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID})"
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+# ─── Book Meeting ──────────────────────────────────────────
+@auth_check
+async def cmd_book_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Book a meeting with a lead."""
+    await update.message.reply_text(
+        "📅 *Book a Meeting*\n\n"
+        "Send me the details in this format:\n\n"
+        "`email@example.com, Contact Name, 2026-03-25, 14:00`\n\n"
+        "Or just share your Calendly link with them:\n"
+        f"{CALENDLY_LINK}",
+        parse_mode="Markdown"
+    )
+
+
+@auth_check
+async def handle_meeting_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle meeting booking from text input."""
+    text = update.message.text
+    if "@" not in text or "," not in text:
+        return  # Not a meeting request
+
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) < 4:
+        await update.message.reply_text("Please use format: `email, name, date, time`", parse_mode="Markdown")
+        return
+
+    email, name, date, time = parts[0], parts[1], parts[2], parts[3]
+
+    await update.message.reply_text(f"⏳ Creating meeting with {name}...")
+
+    result = await meeting_booker.create_meeting(email, name, date, time)
+
+    if result["success"]:
+        await update.message.reply_text(
+            f"✅ *Meeting Booked!*\n\n"
+            f"👤 {name} ({email})\n"
+            f"📅 {date} at {time} (UAE time)\n"
+            f"🔗 Meet: {result.get('meet_link', 'N/A')}\n"
+            f"📎 Event: {result.get('event_link', 'N/A')}",
             parse_mode="Markdown"
         )
     else:
-        await status.edit_text(f"❌ Failed: `{result['message']}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Failed: {result.get('error', 'Unknown error')}\n\n"
+            f"Use Calendly instead: {CALENDLY_LINK}"
+        )
 
-async def cmd_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_auth(update): return
-    if not GMASS_API_KEY:
-        await update.message.reply_text("❌ GMASS_API_KEY not set.")
-        return
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            resp = await c.get("https://api.gmass.co/api/campaigns",
-                              headers={"Authorization": f"Bearer {GMASS_API_KEY}"})
-        if resp.status_code == 200:
-            camps = resp.json()[:8]
-            msg   = "📊 *Campaign Results:*\n\n"
-            for camp in camps:
-                name    = camp.get("name", "Unnamed")[:25]
-                sent    = camp.get("sent", 0)
-                opens   = camp.get("opens", 0)
-                replies = camp.get("replies", 0)
-                pct     = round(opens/sent*100) if sent > 0 else 0
-                msg += f"*{name}*\nSent: {sent} | Opens: {opens} ({pct}%) | Replies: {replies}\n\n"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"GMass API error: {resp.status_code}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
 
-async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_auth(update): return
-    url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
-    await update.message.reply_text(f"📊 *Your Sheet*\n\n{url}", parse_mode="Markdown")
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_auth(update): return
-    s = ctx.bot_data.get("stats", {"lists": 0, "contacts": 0, "campaigns": 0, "emails_found": 0})
+# ─── AI Chat ──────────────────────────────────────────────
+@auth_check
+async def cmd_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"📈 *Today's Activity*\n\n"
-        f"Pipelines run: *{s.get('lists',0)}*\n"
-        f"Companies found: *{s.get('contacts',0)}*\n"
-        f"Real emails extracted: *{s.get('emails_found',0)}*\n"
-        f"Campaigns sent: *{s.get('campaigns',0)}*",
+        "🤖 *AI Assistant Mode*\n\n"
+        "Ask me anything about:\n"
+        "- Sales strategy\n"
+        "- Email copywriting\n"
+        "- Lead qualification\n"
+        "- Industry research\n\n"
+        "Just type your question!",
         parse_mode="Markdown"
     )
 
-# ── PARSE ARGS ───────────────────────────────────────────────────
-def parse_args(text: str):
-    count  = 20
-    region = "UAE"
-    niche  = text
 
-    parts = text.strip().split()
-    if parts and parts[-1].isdigit():
-        count = min(int(parts[-1]), 50)
-        parts = parts[:-1]
-        text  = " ".join(parts)
+@auth_check
+async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle general AI chat messages."""
+    text = update.message.text
 
-    if " in " in text.lower():
-        idx    = text.lower().index(" in ")
-        niche  = text[:idx].strip()
-        region = text[idx+4:].strip()
-    else:
-        niche = text.strip()
+    # Skip if it's a command or button press
+    if text.startswith("/") or text in [
+        "🔍 Find Leads", "📧 Run Outreach", "📊 CRM Dashboard",
+        "📅 Book Meeting", "🔄 Send Follow-ups", "🤖 AI Chat"
+    ]:
+        return
 
-    return niche, region, count
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-# ── NATURAL LANGUAGE ─────────────────────────────────────────────
-async def natural_language(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_auth(update): return
-    text = update.message.text.strip()
+    try:
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=(
+                "You are Rohit's AI sales assistant at InfluNexus, a creative & AI production agency. "
+                "Help with sales strategy, email writing, lead qualification, and business development. "
+                "Be concise and actionable. "
+                f"Company info: {INFLUNEXUS_PITCH}"
+            ),
+            messages=[{"role": "user", "content": text}]
+        )
+        reply = response.content[0].text
+        # Truncate if too long for Telegram
+        if len(reply) > 4000:
+            reply = reply[:4000] + "..."
+        await update.message.reply_text(reply, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"AI error: {e}")
 
-    find_keywords = ["find", "get", "need", "show", "list", "search",
-                     "companies", "brands", "business", "shoes", "jewellery",
-                     "fashion", "real estate", "sports", "luxury", "contact"]
 
-    if any(kw in text.lower() for kw in find_keywords):
-        parse_prompt = f"""Extract from: "{text}"
-Return ONLY JSON: {{"niche": "...", "region": "...", "count": 20}}
-Default region: UAE. Max count: 50."""
+# ─── Button Router ─────────────────────────────────────────
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route keyboard button presses."""
+    text = update.message.text
+
+    routes = {
+        "🔍 Find Leads": cmd_find_leads,
+        "📧 Run Outreach": cmd_run_outreach,
+        "📊 CRM Dashboard": cmd_dashboard,
+        "📅 Book Meeting": cmd_book_meeting,
+        "🔄 Send Follow-ups": cmd_followups,
+        "🤖 AI Chat": cmd_ai_chat,
+    }
+
+    handler = routes.get(text)
+    if handler:
+        return await handler(update, context)
+
+
+# ─── Follow-up Scheduler (Background Job) ─────────────────
+async def followup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Auto-send follow-ups (runs every 6 hours)."""
+    pending = crm.get_pending_followups()
+    if not pending:
+        return
+
+    success = 0
+    for fu in pending:
+        email = fu.get("Email", "")
+        fu_num = fu.get("Follow-up #", 1)
+        lead = {"email": email, "contact_name": "", "company": "", "industry": ""}
+        email_type = "followup_1" if fu_num == 1 else "followup_2"
+        email_data = email_engine.generate_email(lead, email_type)
+
+        sent = email_engine.send_via_smtp(email, email_data["subject"], email_data["body"])
+        if sent:
+            success += 1
+            crm.mark_followup_sent(fu.get("Lead ID", ""), fu_num)
+        await asyncio.sleep(2)
+
+    if ALLOWED_USER_ID and success > 0:
         try:
-            resp   = ai.messages.create(model="claude-sonnet-4-6", max_tokens=100,
-                                        messages=[{"role": "user", "content": parse_prompt}])
-            parsed = json.loads(resp.content[0].text.strip())
-            niche  = parsed.get("niche", text)
-            region = parsed.get("region", "UAE")
-            count  = min(int(parsed.get("count", 20)), 50)
-            await run_full_pipeline(update, ctx, niche, region, count, send_campaign=True)
-        except Exception:
-            await update.message.reply_text(
-                "Try: `/run shoes companies in Dubai 20`\nor just type: `shoes companies in Dubai 20`",
-                parse_mode="Markdown"
+            await context.bot.send_message(
+                chat_id=ALLOWED_USER_ID,
+                text=f"🔄 Auto follow-up: {success}/{len(pending)} sent!"
             )
-    else:
-        await update.message.reply_text("Type `/help` to see what I can do.", parse_mode="Markdown")
+        except Exception:
+            pass
 
-# ── BUTTONS ──────────────────────────────────────────────────────
-async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data  = query.data
 
-    if data.startswith("send|"):
-        _, tname, template = data.split("|", 2)
-        status = await query.message.reply_text(f"🚀 Sending campaign...", parse_mode="Markdown")
-        result = await launch_gmass(tname, template, follow_up=True)
-        if result["status"] == "success":
-            upd_stats(ctx, campaigns=1)
-            await status.edit_text("✅ *Campaign sent!* Follow-ups scheduled. Check `/results` in 48h.", parse_mode="Markdown")
-        else:
-            await status.edit_text(f"❌ Failed: `{result['message']}`", parse_mode="Markdown")
-    elif data == "new_run":
-        await query.message.reply_text("What next? Just type:\n`shoes companies in Qatar 20`", parse_mode="Markdown")
-
-# ── MAIN ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  MAIN — Wire everything up
+# ═══════════════════════════════════════════════════════════
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("run",     cmd_run))
-    app.add_handler(CommandHandler("find",    cmd_find))
-    app.add_handler(CommandHandler("send",    cmd_send))
-    app.add_handler(CommandHandler("results", cmd_results))
-    app.add_handler(CommandHandler("sheet",   cmd_sheet))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language))
-    log.info("InfluNexus Autonomous Agent v3 starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Conversation handler for lead search flow
+    search_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("find", cmd_find_leads),
+            MessageHandler(filters.Regex("^🔍 Find Leads$"), cmd_find_leads),
+        ],
+        states={
+            SEARCH_INDUSTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_industry)],
+            SEARCH_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location)],
+            SEARCH_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_count)],
+            CONFIRM_OUTREACH: [CallbackQueryHandler(handle_outreach_callback)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+        allow_reentry=True
+    )
+
+    # Register handlers (order matters!)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
+    app.add_handler(CommandHandler("outreach", cmd_run_outreach))
+    app.add_handler(CommandHandler("followups", cmd_followups))
+    app.add_handler(CommandHandler("meeting", cmd_book_meeting))
+
+    app.add_handler(search_conv)
+
+    # CRM outreach callbacks
+    app.add_handler(CallbackQueryHandler(handle_crm_outreach_callback, pattern="^(outreach_crm_all|cancel_outreach)$"))
+
+    # Button router for reply keyboard
+    app.add_handler(MessageHandler(
+        filters.Regex("^(📧 Run Outreach|📊 CRM Dashboard|📅 Book Meeting|🔄 Send Follow-ups|🤖 AI Chat)$"),
+        button_router
+    ))
+
+    # General AI message handler (catch-all, must be last)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message))
+
+    # Background job: auto follow-ups every 6 hours
+    job_queue = app.job_queue
+    job_queue.run_repeating(followup_job, interval=21600, first=60)
+
+    log.info("🚀 InfluNexus Agent Bot v4 starting...")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
