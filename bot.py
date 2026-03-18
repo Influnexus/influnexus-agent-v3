@@ -649,7 +649,10 @@ Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
     def send_via_smtp(self, to_email: str, subject: str, body: str) -> bool:
         """Send a single email via Google Workspace SMTP."""
         if not SMTP_PASSWORD:
-            log.error("SMTP password not configured")
+            log.error("SMTP password not configured — set SMTP_PASSWORD env var")
+            return False
+        if not SMTP_EMAIL:
+            log.error("SMTP email not configured — set SMTP_EMAIL env var")
             return False
 
         try:
@@ -671,15 +674,23 @@ Return ONLY a JSON object with "subject" and "body" keys. No markdown."""
             msg.attach(MIMEText(body, "plain"))
             msg.attach(MIMEText(html, "html"))
 
+            log.info(f"Connecting to SMTP for {to_email}...")
             with smtplib.SMTP("smtp.gmail.com", 587) as server:
                 server.starttls()
+                log.info(f"SMTP login as {SMTP_EMAIL}...")
                 server.login(SMTP_EMAIL, SMTP_PASSWORD)
                 server.send_message(msg)
 
-            log.info(f"SMTP email sent to {to_email}")
+            log.info(f"✅ Email sent to {to_email}")
             return True
+        except smtplib.SMTPAuthenticationError as e:
+            log.error(f"❌ SMTP AUTH FAILED — check SMTP_PASSWORD (App Password). Error: {e}")
+            return False
+        except smtplib.SMTPException as e:
+            log.error(f"❌ SMTP error to {to_email}: {e}")
+            return False
         except Exception as e:
-            log.error(f"SMTP send failed to {to_email}: {e}")
+            log.error(f"❌ SMTP send failed to {to_email}: {type(e).__name__}: {e}")
             return False
 
 
@@ -939,53 +950,59 @@ async def handle_outreach_callback(update: Update, context: ContextTypes.DEFAULT
         success_count = 0
         fail_count = 0
 
-        # For bulk: use GMass if available
+        # Try GMass first for bulk, fall back to SMTP
+        gmass_worked = False
         if GMASS_API_KEY and len(leads) > 10:
-            # Generate a template email for bulk
-            sample_lead = leads[0]
-            email_data = email_engine.generate_email(sample_lead, "initial")
+            try:
+                sample_lead = leads[0]
+                email_data = email_engine.generate_email(sample_lead, "initial")
 
-            # Personalize subject with merge tags
-            email_data["subject"] = email_data["subject"].replace(
-                sample_lead.get("company", ""), "{Company}"
-            )
-            email_data["body"] = email_data["body"].replace(
-                sample_lead.get("contact_name", ""), "{Name}"
-            ).replace(
-                sample_lead.get("company", ""), "{Company}"
-            )
-
-            result = await email_engine.send_via_gmass(leads, email_data)
-            if result["success"]:
-                success_count = len(leads)
-                # Log all outreach
-                for lead in leads:
-                    crm.log_outreach(lead.get("id", ""), lead["email"], "Initial - GMass", email_data["subject"])
-                    crm.update_lead_status(lead.get("id", ""), "Contacted")
-                    # Schedule follow-ups
-                    crm.schedule_followup(lead.get("id", ""), lead["email"], 1, 3, "followup_1")
-                    crm.schedule_followup(lead.get("id", ""), lead["email"], 2, 7, "followup_2")
-            else:
-                fail_count = len(leads)
-        else:
-            # SMTP individual sends with personalized emails
-            for lead in leads:
-                email_data = email_engine.generate_email(lead, "initial")
-                sent = email_engine.send_via_smtp(
-                    lead["email"],
-                    email_data["subject"],
-                    email_data["body"]
+                email_data["subject"] = email_data["subject"].replace(
+                    sample_lead.get("company", ""), "{Company}"
                 )
-                if sent:
-                    success_count += 1
-                    crm.log_outreach(lead.get("id", ""), lead["email"], "Initial - SMTP", email_data["subject"])
-                    crm.update_lead_status(lead.get("id", ""), "Contacted")
-                    crm.schedule_followup(lead.get("id", ""), lead["email"], 1, 3, "followup_1")
-                    crm.schedule_followup(lead.get("id", ""), lead["email"], 2, 7, "followup_2")
+                email_data["body"] = email_data["body"].replace(
+                    sample_lead.get("contact_name", ""), "{Name}"
+                ).replace(
+                    sample_lead.get("company", ""), "{Company}"
+                )
+
+                result = await email_engine.send_via_gmass(leads, email_data)
+                if result["success"]:
+                    gmass_worked = True
+                    success_count = len(leads)
+                    for lead in leads:
+                        crm.log_outreach(lead.get("id", ""), lead["email"], "Initial - GMass", email_data["subject"])
+                        crm.update_lead_status(lead.get("id", ""), "Contacted")
+                        crm.schedule_followup(lead.get("id", ""), lead["email"], 1, 3, "followup_1")
+                        crm.schedule_followup(lead.get("id", ""), lead["email"], 2, 7, "followup_2")
                 else:
+                    log.warning(f"GMass failed: {result.get('error', 'unknown')}. Falling back to SMTP...")
+            except Exception as e:
+                log.error(f"GMass error: {e}. Falling back to SMTP...")
+
+        # SMTP sending (either as fallback or primary)
+        if not gmass_worked:
+            for lead in leads:
+                try:
+                    email_data = email_engine.generate_email(lead, "initial")
+                    sent = email_engine.send_via_smtp(
+                        lead["email"],
+                        email_data["subject"],
+                        email_data["body"]
+                    )
+                    if sent:
+                        success_count += 1
+                        crm.log_outreach(lead.get("id", ""), lead["email"], "Initial - SMTP", email_data["subject"])
+                        crm.update_lead_status(lead.get("id", ""), "Contacted")
+                        crm.schedule_followup(lead.get("id", ""), lead["email"], 1, 3, "followup_1")
+                        crm.schedule_followup(lead.get("id", ""), lead["email"], 2, 7, "followup_2")
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    log.error(f"SMTP send error for {lead.get('email', '?')}: {e}")
                     fail_count += 1
-                # Rate limiting
-                await asyncio.sleep(2)
+                # Rate limiting - avoid Gmail throttling
+                await asyncio.sleep(3)
 
         await context.bot.send_message(
             chat_id=query.message.chat_id,
@@ -1325,6 +1342,15 @@ def main():
         log.warning("Job queue not available — follow-ups must be triggered manually.")
 
     log.info("🚀 InfluNexus Agent Bot v4 starting...")
+    log.info(f"   Telegram: ✅ configured")
+    log.info(f"   Claude AI: {'✅' if CLAUDE_API_KEY else '❌'}")
+    log.info(f"   Google Sheets: {'✅' if crm.sheet else '❌'}")
+    log.info(f"   Apollo: {'✅' if APOLLO_API_KEY else '❌ (skipped)'}")
+    log.info(f"   Hunter: {'✅' if HUNTER_API_KEY else '❌ (skipped)'}")
+    log.info(f"   SerpAPI: {'✅' if SERPAPI_KEY else '❌ (skipped)'}")
+    log.info(f"   GMass: {'✅' if GMASS_API_KEY else '❌ (will use SMTP)'}")
+    log.info(f"   SMTP Email: {SMTP_EMAIL}")
+    log.info(f"   SMTP Password: {'✅ set' if SMTP_PASSWORD else '❌ NOT SET'}")
     app.run_polling(drop_pending_updates=True)
 
 
