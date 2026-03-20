@@ -13,9 +13,7 @@ Full-stack Telegram bot that:
 Deploy on Railway with environment variables.
 """
 
-import os, json, asyncio, logging, re, smtplib, hashlib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os, json, asyncio, logging, random, re, hashlib
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, quote_plus
 import httpx
@@ -273,21 +271,36 @@ Return ONLY JSON: {{"subject":"...","body":"..."}}"""
     def _fb(self,l):
         return {"subject":f"Creative & AI Production for {l.get('company','your brand')} — InfluNexus","body":f"Hi {l.get('contact_name','there')},\n\nI'm Rohit from InfluNexus — a creative & AI production agency across UAE, India, and the UK.\n\nI'd love to explore how we could support {l.get('company','your brand')} with premium video, AI visuals, or digital campaigns.\n\nOpen to a quick 15-min chat?\n\nBook a time: {CALENDLY_LINK}\n\nBest,\nRohit\nFounder, InfluNexus\n{COMPANY_WEBSITE}"}
     async def send_gmass(self,leads,ed):
-        if not GMASS_API_KEY: return {"success":False}
+        if not GMASS_API_KEY: return {"success":False,"error":"No GMass key"}
         try:
             async with httpx.AsyncClient(timeout=30) as c:
                 r=await c.post("https://api.gmass.co/api/campaigns",json={"apiKey":GMASS_API_KEY,"subject":ed["subject"],"message":ed["body"],"recipients":[{"EmailAddress":l.get("email",""),"Name":l.get("contact_name",""),"Company":l.get("company","")} for l in leads],"openTracking":True,"clickTracking":True,"sendAs":SMTP_EMAIL})
-                return {"success":r.status_code==200,"data":r.json() if r.status_code==200 else r.text}
+                if r.status_code==200: return {"success":True,"data":r.json()}
+                log.error(f"GMass bulk error: {r.status_code} {r.text[:200]}")
+                return {"success":False,"error":r.text[:200]}
         except Exception as e: return {"success":False,"error":str(e)}
-    def send_smtp(self,to,subj,body):
-        if not SMTP_PASSWORD: log.error("No SMTP_PASSWORD"); return False
+    async def send_single(self,to,subj,body):
+        """Send single email via GMass API (HTTPS, works on Railway)."""
+        if not GMASS_API_KEY:
+            log.error("No GMASS_API_KEY set"); return False
         try:
-            msg=MIMEMultipart("alternative"); msg["From"]=f"Rohit | InfluNexus <{SMTP_EMAIL}>"; msg["To"]=to; msg["Subject"]=subj
-            msg.attach(MIMEText(body,"plain")); msg.attach(MIMEText(f"<html><body style='font-family:Arial;color:#333;line-height:1.6;'>{body.replace(chr(10),'<br>')}</body></html>","html"))
-            with smtplib.SMTP("smtp.gmail.com",587) as s: s.starttls(); s.login(SMTP_EMAIL,SMTP_PASSWORD); s.send_message(msg)
-            log.info(f"✅ Sent to {to}"); return True
-        except smtplib.SMTPAuthenticationError as e: log.error(f"❌ SMTP AUTH FAIL: {e}"); return False
-        except Exception as e: log.error(f"❌ SMTP fail {to}: {e}"); return False
+            async with httpx.AsyncClient(timeout=30) as c:
+                r=await c.post("https://api.gmass.co/api/campaigns",json={
+                    "apiKey":GMASS_API_KEY,
+                    "subject":subj,
+                    "message":body.replace(chr(10),'<br>'),
+                    "recipients":[{"EmailAddress":to}],
+                    "openTracking":True,"clickTracking":True,"sendAs":SMTP_EMAIL
+                })
+                if r.status_code==200:
+                    log.info(f"✅ Email sent to {to} via GMass")
+                    return True
+                else:
+                    log.error(f"❌ GMass send failed to {to}: {r.status_code} {r.text[:200]}")
+                    return False
+        except Exception as e:
+            log.error(f"❌ GMass error for {to}: {e}")
+            return False
 
 class MeetingBooker:
     def __init__(self):
@@ -314,8 +327,8 @@ def auth_check(func):
 
 @auth_check
 async def cmd_start(update,context):
-    kb=ReplyKeyboardMarkup([["🔍 Find Leads","📧 Run Outreach"],["📊 CRM Dashboard","📅 Book Meeting"],["🔄 Send Follow-ups","🤖 AI Chat"]],resize_keyboard=True)
-    await update.message.reply_text("🚀 *InfluNexus Sales Agent v5*\n\n🔍 *Find Leads* — Any business + location\n  → Google Maps + website email scraping\n  → Apollo + Hunter + Google Search\n📧 *Outreach* — AI-personalized emails\n📊 *Dashboard* — Pipeline stats\n📅 *Meeting* — Google Meet booking\n🔄 *Follow-ups* — Auto sequences\n🤖 *AI Chat* — Strategy assistant\n\nTry: coffee shops → Dubai → 50",parse_mode="Markdown",reply_markup=kb)
+    kb=ReplyKeyboardMarkup([["🔍 Find Leads","📧 Run Outreach"],["📊 CRM Dashboard","📅 Book Meeting"],["🔄 Send Follow-ups","📸 Instagram DM"],["🤖 AI Chat"]],resize_keyboard=True)
+    await update.message.reply_text("🚀 *InfluNexus Sales Agent v5*\n\n🔍 *Find Leads* — Any business + location\n  → Google Maps + website email scraping\n📧 *Outreach* — AI-personalized emails\n📊 *Dashboard* — Pipeline stats\n📅 *Meeting* — Google Meet booking\n🔄 *Follow-ups* — Auto sequences\n📸 *Instagram DM* — Cold DM + auto-reply\n🤖 *AI Chat* — Strategy assistant\n\nTry: coffee shops → Dubai → 50",parse_mode="Markdown",reply_markup=kb)
 
 @auth_check
 async def cmd_find(update,context):
@@ -366,7 +379,7 @@ async def h_outreach_cb(update,context):
         for l in leads:
             try:
                 ed=email_engine.generate_email(l,"initial")
-                if email_engine.send_smtp(l["email"],ed["subject"],ed["body"]):
+                if await email_engine.send_single(l["email"],ed["subject"],ed["body"]):
                     ok+=1; crm.log_outreach(l.get("id",""),l["email"],"SMTP",ed["subject"]); crm.update_lead_status(l.get("id",""),"Contacted"); crm.schedule_followup(l.get("id",""),l["email"],1,3,"f1"); crm.schedule_followup(l.get("id",""),l["email"],2,7,"f2")
                 else: fail+=1
             except: fail+=1
@@ -388,7 +401,7 @@ async def h_crm_cb(update,context):
     ok=0
     for l in nl:
         ed=email_engine.generate_email(l,"initial")
-        if email_engine.send_smtp(l["Email"],ed["subject"],ed["body"]):
+        if await email_engine.send_single(l["Email"],ed["subject"],ed["body"]):
             ok+=1; crm.log_outreach(l["ID"],l["Email"],"Initial",ed["subject"]); crm.update_lead_status(l["ID"],"Contacted"); crm.schedule_followup(l["ID"],l["Email"],1,3,"f1"); crm.schedule_followup(l["ID"],l["Email"],2,7,"f2")
         await asyncio.sleep(3)
     await context.bot.send_message(chat_id=q.message.chat_id,text=f"✅ Sent {ok}/{len(nl)}")
@@ -402,7 +415,7 @@ async def cmd_followups(update,context):
     for f in p:
         e=f.get("Email",""); n=f.get("Follow-up #",1); l={"email":e,"contact_name":"","company":"","industry":""}
         ed=email_engine.generate_email(l,"followup_1" if n==1 else "followup_2")
-        if email_engine.send_smtp(e,ed["subject"],ed["body"]): ok+=1; crm.mark_followup_sent(f.get("Lead ID",""),n)
+        if await email_engine.send_single(e,ed["subject"],ed["body"]): ok+=1; crm.mark_followup_sent(f.get("Lead ID",""),n)
         await asyncio.sleep(3)
     await update.message.reply_text(f"✅ Sent {ok}/{len(p)}")
 
@@ -447,6 +460,11 @@ async def btn_route(update,context):
     routes={"🔍 Find Leads":cmd_find,"📧 Run Outreach":cmd_outreach,"📊 CRM Dashboard":cmd_dash,"📅 Book Meeting":cmd_meet,"🔄 Send Follow-ups":cmd_followups,"🤖 AI Chat":cmd_ai}
     h=routes.get(update.message.text)
     if h: return await h(update,context)
+    if update.message.text=="📸 Instagram DM":
+        try:
+            from insta_bot import cmd_ig_start
+            return await cmd_ig_start(update,context)
+        except: await update.message.reply_text("Instagram module not available. Check IG_USERNAME and IG_PASSWORD env vars.")
 
 async def fu_job(context):
     p=crm.get_pending_followups()
@@ -455,7 +473,7 @@ async def fu_job(context):
     for f in p:
         e=f.get("Email",""); n=f.get("Follow-up #",1); l={"email":e,"contact_name":"","company":"","industry":""}
         ed=email_engine.generate_email(l,"followup_1" if n==1 else "followup_2")
-        if email_engine.send_smtp(e,ed["subject"],ed["body"]): ok+=1; crm.mark_followup_sent(f.get("Lead ID",""),n)
+        if await email_engine.send_single(e,ed["subject"],ed["body"]): ok+=1; crm.mark_followup_sent(f.get("Lead ID",""),n)
         await asyncio.sleep(3)
     if ALLOWED_USER_ID and ok>0:
         try: await context.bot.send_message(chat_id=ALLOWED_USER_ID,text=f"🔄 Auto follow-up: {ok}/{len(p)} sent!")
@@ -463,13 +481,23 @@ async def fu_job(context):
 
 def main():
     app=Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Import and setup Instagram handlers
+    try:
+        from insta_bot import setup_ig_handlers
+        setup_ig_handlers(app)
+        ig_status = "✅"
+    except Exception as e:
+        log.warning(f"Instagram module not loaded: {e}")
+        ig_status = "❌"
+
     sc=ConversationHandler(entry_points=[CommandHandler("find",cmd_find),MessageHandler(filters.Regex("^🔍 Find Leads$"),cmd_find)],states={SEARCH_INDUSTRY:[MessageHandler(filters.TEXT&~filters.COMMAND,h_ind)],SEARCH_LOCATION:[MessageHandler(filters.TEXT&~filters.COMMAND,h_loc)],SEARCH_COUNT:[MessageHandler(filters.TEXT&~filters.COMMAND,h_cnt)],CONFIRM_OUTREACH:[CallbackQueryHandler(h_outreach_cb)]},fallbacks=[CommandHandler("cancel",lambda u,c:ConversationHandler.END)],allow_reentry=True)
     app.add_handler(CommandHandler("start",cmd_start)); app.add_handler(CommandHandler("help",cmd_start))
     app.add_handler(CommandHandler("dashboard",cmd_dash)); app.add_handler(CommandHandler("outreach",cmd_outreach))
     app.add_handler(CommandHandler("followups",cmd_followups)); app.add_handler(CommandHandler("meeting",cmd_meet))
     app.add_handler(sc)
     app.add_handler(CallbackQueryHandler(h_crm_cb,pattern="^(outreach_crm_all|cancel_outreach)$"))
-    app.add_handler(MessageHandler(filters.Regex("^(📧 Run Outreach|📊 CRM Dashboard|📅 Book Meeting|🔄 Send Follow-ups|🤖 AI Chat)$"),btn_route))
+    app.add_handler(MessageHandler(filters.Regex("^(📧 Run Outreach|📊 CRM Dashboard|📅 Book Meeting|🔄 Send Follow-ups|🤖 AI Chat|📸 Instagram DM)$"),btn_route))
     app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,h_ai))
     jq=app.job_queue
     if jq: jq.run_repeating(fu_job,interval=21600,first=60); log.info("✅ Follow-up scheduler on (6h)")
@@ -477,6 +505,7 @@ def main():
     log.info(f"   Telegram: ✅ | Gemini: {'✅' if GEMINI_API_KEY else '❌'} | Sheets: {'✅' if crm.sheet else '❌'}")
     log.info(f"   Apollo: {'✅' if APOLLO_API_KEY else '⚪'} | Hunter: {'✅' if HUNTER_API_KEY else '⚪'} | SerpAPI: {'✅' if SERPAPI_KEY else '❌'}")
     log.info(f"   SMTP: {SMTP_EMAIL} | Pass: {'✅' if SMTP_PASSWORD else '❌'} | GMass: {'✅' if GMASS_API_KEY else '⚪'}")
+    log.info(f"   Instagram: {ig_status}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__=="__main__": main()
