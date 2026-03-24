@@ -1,0 +1,5 @@
+python-telegram-bot==21.6
+aiohttp==3.10.10
+gspread==6.1.4
+google-auth==2.36.0
+google-api-python-client==2.154.0
