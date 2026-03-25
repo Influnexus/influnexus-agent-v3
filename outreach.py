@@ -215,16 +215,21 @@ async def outreach_flow(leads: list[dict], subject: str) -> dict:
     if leads_without_email > 0:
         errors.append(f"{leads_without_email} leads skipped (no email)")
 
-    # Try GMass bulk first
-    if GMASS_API_KEY:
-        result = await send_via_gmass(leads_with_email, subject)
-        if result["sent"] > 0:
-            try:
-                await crm_add_lead(leads, status="Outreached")
-            except Exception as e:
-                logger.error(f"CRM save after GMass: {e}")
-            result["errors"] = errors + result.get("errors", [])
-            return result
+    # Log credential status for debugging
+    logger.info(f"GMAIL_CLIENT_ID length: {len(GMAIL_CLIENT_ID)}")
+    logger.info(f"GMAIL_CLIENT_SECRET length: {len(GMAIL_CLIENT_SECRET)}")
+    logger.info(f"GMAIL_REFRESH_TOKEN length: {len(GMAIL_REFRESH_TOKEN)}")
+    logger.info(f"GMAIL_SENDER_EMAIL: {GMAIL_SENDER_EMAIL}")
+    logger.info(f"GMAIL_CLIENT_ID ends with: ...{GMAIL_CLIENT_ID[-30:]}" if GMAIL_CLIENT_ID else "GMAIL_CLIENT_ID is empty")
+
+    # Skip GMass — use Gmail API directly (GMass key is unreliable)
+    # If you want GMass back, remove this comment and uncomment below
+    # if GMASS_API_KEY:
+    #     result = await send_via_gmass(leads_with_email, subject)
+    #     if result["sent"] > 0:
+    #         await crm_add_lead(leads, status="Outreached")
+    #         result["errors"] = errors + result.get("errors", [])
+    #         return result
 
     # Individual emails via Gmail API / SMTP
     sent = 0
