@@ -137,12 +137,14 @@ async def do_find_leads(update: Update, context):
 
     context.user_data["found_leads"] = leads
 
-    msg = f"Found *{len(leads)}* leads:\n\n"
+    with_email = sum(1 for l in leads if l.get("email"))
+    msg = f"Found *{len(leads)}* leads ({with_email} with email):\n\n"
     for i, lead in enumerate(leads, 1):
+        email_display = lead.get("email") or "No email found"
         msg += (
             f"*{i}.* {lead.get('name', 'N/A')}\n"
             f"   Company: {lead.get('company', 'N/A')}\n"
-            f"   Email: {lead.get('email', 'N/A')}\n"
+            f"   Email: {email_display}\n"
             f"   Phone: {lead.get('phone', 'N/A')}\n\n"
         )
 
@@ -223,11 +225,23 @@ async def outreach_send(update: Update, context):
         subject=context.user_data.get("email_subject", ""),
     )
 
-    await query.edit_message_text(
+    msg = (
         f"*Outreach Complete!*\n\n"
         f"Sent: {results['sent']}\n"
-        f"Failed: {results['failed']}\n\n"
-        f"Leads saved to CRM.",
+        f"Failed: {results['failed']}\n"
+    )
+
+    # Show errors so user knows what went wrong
+    errors = results.get("errors", [])
+    if errors:
+        msg += "\n*Issues:*\n"
+        for err in errors[:5]:  # Max 5 errors to avoid message too long
+            msg += f"- {err}\n"
+
+    msg += "\nLeads saved to CRM."
+
+    await query.edit_message_text(
+        msg,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Main Menu", callback_data="main_menu")]
         ]),

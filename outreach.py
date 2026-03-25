@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import smtplib
+import asyncio
 import aiohttp
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -20,10 +21,13 @@ OUTREACH_SUBJECT = 10
 OUTREACH_CONFIRM = 11
 
 
-async def send_email_smtp(to_email: str, subject: str, body_html: str) -> bool:
+async def send_email_smtp(to_email: str, subject: str, body_html: str) -> dict:
+    """Send email via Gmail SMTP. Returns dict with status and error."""
     if not SMTP_EMAIL or not SMTP_PASSWORD:
-        logger.error("SMTP credentials not configured")
-        return False
+        return {"success": False, "error": "SMTP_EMAIL or SMTP_PASSWORD not set in Railway variables"}
+
+    if not to_email or "@" not in to_email:
+        return {"success": False, "error": f"Invalid email: '{to_email}'"}
 
     try:
         msg = MIMEMultipart("alternative")
@@ -35,20 +39,32 @@ async def send_email_smtp(to_email: str, subject: str, body_html: str) -> bool:
         msg.attach(MIMEText(plain, "plain"))
         msg.attach(MIMEText(body_html, "html"))
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        # Run SMTP in a thread so it doesn't block the bot
+        def _send():
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+                server.login(SMTP_EMAIL, SMTP_PASSWORD)
+                server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+
+        await asyncio.get_event_loop().run_in_executor(None, _send)
 
         logger.info(f"Email sent to {to_email}")
-        return True
+        return {"success": True, "error": ""}
+    except smtplib.SMTPAuthenticationError:
+        error = "Gmail login failed. Check SMTP_EMAIL and SMTP_PASSWORD (must be App Password, not regular password)"
+        logger.error(error)
+        return {"success": False, "error": error}
+    except smtplib.SMTPRecipientsRefused:
+        error = f"Recipient refused: {to_email}"
+        logger.error(error)
+        return {"success": False, "error": error}
     except Exception as e:
         logger.error(f"SMTP error ({to_email}): {e}")
-        return False
+        return {"success": False, "error": str(e)}
 
 
 async def send_via_gmass(leads: list[dict], subject: str) -> dict:
     if not GMASS_API_KEY:
-        return {"sent": 0, "failed": len(leads)}
+        return {"sent": 0, "failed": len(leads), "errors": ["GMASS_API_KEY not set"]}
 
     email_list = []
     for lead in leads:
@@ -60,6 +76,9 @@ async def send_via_gmass(leads: list[dict], subject: str) -> dict:
                 "Company": lead.get("company", ""),
                 "CustomBody": body,
             })
+
+    if not email_list:
+        return {"sent": 0, "failed": len(leads), "errors": ["No leads have email addresses"]}
 
     payload = {
         "subject": subject,
@@ -75,37 +94,59 @@ async def send_via_gmass(leads: list[dict], subject: str) -> dict:
                 headers={"apikey": GMASS_API_KEY},
             ) as resp:
                 if resp.status == 200:
-                    return {"sent": len(email_list), "failed": 0}
-                logger.error(f"GMass error: {await resp.text()}")
-                return {"sent": 0, "failed": len(email_list)}
+                    return {"sent": len(email_list), "failed": 0, "errors": []}
+                err = await resp.text()
+                logger.error(f"GMass error: {err}")
+                return {"sent": 0, "failed": len(email_list), "errors": [f"GMass API: {err}"]}
     except Exception as e:
         logger.error(f"GMass error: {e}")
-        return {"sent": 0, "failed": len(email_list)}
+        return {"sent": 0, "failed": len(email_list), "errors": [str(e)]}
 
 
 async def outreach_flow(leads: list[dict], subject: str) -> dict:
+    errors = []
+
+    # Count how many leads have emails
+    leads_with_email = [l for l in leads if l.get("email") and "@" in l.get("email", "")]
+    leads_without_email = len(leads) - len(leads_with_email)
+
+    if not leads_with_email:
+        return {
+            "sent": 0,
+            "failed": len(leads),
+            "errors": [f"None of the {len(leads)} leads have email addresses. Apollo free tier may hide emails. Make sure HUNTER_API_KEY is set to enrich leads."],
+        }
+
+    if leads_without_email > 0:
+        errors.append(f"{leads_without_email} leads skipped (no email)")
+
     # Try GMass bulk first
     if GMASS_API_KEY:
-        result = await send_via_gmass(leads, subject)
+        result = await send_via_gmass(leads_with_email, subject)
         if result["sent"] > 0:
             await crm_add_lead(leads, status="Outreached")
+            result["errors"] = errors + result.get("errors", [])
             return result
 
     # Fallback: individual SMTP
     sent = 0
     failed = 0
-    for lead in leads:
-        email = lead.get("email", "")
-        if not email:
-            failed += 1
-            continue
-
+    for lead in leads_with_email:
+        email = lead["email"]
         body = await generate_outreach_email(lead, subject)
-        if await send_email_smtp(email, subject, body):
+        result = await send_email_smtp(email, subject, body)
+
+        if result["success"]:
             sent += 1
             await crm_update_status(email, "Outreached")
         else:
             failed += 1
+            errors.append(f"{email}: {result['error']}")
+            # If first email fails with auth error, stop trying
+            if "login failed" in result["error"].lower():
+                errors.append("Stopping - Gmail auth failed for all remaining")
+                failed += len(leads_with_email) - sent - failed
+                break
 
-    await crm_add_lead(leads, status="Outreached")
-    return {"sent": sent, "failed": failed}
+    await crm_add_lead(leads, status="Outreached" if sent > 0 else "New")
+    return {"sent": sent, "failed": failed + leads_without_email, "errors": errors}
