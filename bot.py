@@ -464,6 +464,65 @@ async def instagram_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── /test command — diagnose email credentials ────────────────────
+
+@restricted
+async def test_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send /test to check if Gmail API works on Railway."""
+    from outreach import (
+        GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN,
+        GMAIL_SENDER_EMAIL, SMTP_EMAIL, SMTP_PASSWORD,
+        send_email_gmail_api, send_email_smtp,
+    )
+
+    msg = "Email Diagnostics:\n\n"
+
+    # Check what's set
+    msg += "Variables:\n"
+    msg += f"  GMAIL_CLIENT_ID: {'SET (' + str(len(GMAIL_CLIENT_ID)) + ' chars)' if GMAIL_CLIENT_ID else 'NOT SET'}\n"
+    if GMAIL_CLIENT_ID:
+        msg += f"    ends with: ...{GMAIL_CLIENT_ID[-25:]}\n"
+    msg += f"  GMAIL_CLIENT_SECRET: {'SET (' + str(len(GMAIL_CLIENT_SECRET)) + ' chars)' if GMAIL_CLIENT_SECRET else 'NOT SET'}\n"
+    msg += f"  GMAIL_REFRESH_TOKEN: {'SET (' + str(len(GMAIL_REFRESH_TOKEN)) + ' chars)' if GMAIL_REFRESH_TOKEN else 'NOT SET'}\n"
+    msg += f"  GMAIL_SENDER_EMAIL: {GMAIL_SENDER_EMAIL or 'NOT SET'}\n"
+    msg += f"  SMTP_EMAIL: {'SET' if SMTP_EMAIL else 'NOT SET'}\n"
+    msg += f"  SMTP_PASSWORD: {'SET' if SMTP_PASSWORD else 'NOT SET'}\n\n"
+
+    await update.message.reply_text(msg)
+
+    # Test Gmail API
+    if all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN]):
+        await update.message.reply_text("Testing Gmail API...")
+        test_to = GMAIL_SENDER_EMAIL or SMTP_EMAIL
+        result = await send_email_gmail_api(
+            test_to,
+            "Influnexus Bot Test - Gmail API",
+            "<p>Gmail API is working on Railway!</p>",
+        )
+        if result["success"]:
+            await update.message.reply_text(f"Gmail API: SUCCESS! Email sent to {test_to}")
+        else:
+            await update.message.reply_text(f"Gmail API: FAILED\n{result['error']}")
+    else:
+        await update.message.reply_text("Gmail API: Skipped (credentials missing)")
+
+    # Test SMTP
+    if SMTP_EMAIL and SMTP_PASSWORD:
+        await update.message.reply_text("Testing SMTP...")
+        test_to = GMAIL_SENDER_EMAIL or SMTP_EMAIL
+        result = await send_email_smtp(
+            test_to,
+            "Influnexus Bot Test - SMTP",
+            "<p>SMTP is working on Railway!</p>",
+        )
+        if result["success"]:
+            await update.message.reply_text(f"SMTP: SUCCESS! Email sent to {test_to}")
+        else:
+            await update.message.reply_text(f"SMTP: FAILED\n{result['error']}")
+
+    await update.message.reply_text("Diagnostics complete.", reply_markup=MAIN_MENU)
+
+
 # ── GLOBAL ERROR HANDLER ────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -525,6 +584,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", test_email))
     app.add_handler(leads_conv)
     app.add_handler(outreach_conv)
     app.add_handler(CallbackQueryHandler(crm_handler, pattern="^crm_dashboard$"))
