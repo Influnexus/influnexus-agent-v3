@@ -18,7 +18,8 @@ async def _call_ai(prompt: str, system: str = "") -> str:
     messages.append({"role": "user", "content": prompt})
 
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 json={

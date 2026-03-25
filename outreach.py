@@ -213,8 +213,9 @@ async def outreach_flow(leads: list[dict], subject: str) -> dict:
             errors.append(f"{email}: {result['error']}")
             # If first email fails with auth error, stop trying
             if "login failed" in result["error"].lower():
-                errors.append("Stopping - Gmail auth failed for all remaining")
-                failed += len(leads_with_email) - sent - failed
+                remaining = len(leads_with_email) - sent - failed
+                errors.append(f"Stopping - auth failed, skipping {remaining} remaining")
+                failed += remaining
                 break
 
     await crm_add_lead(leads, status="Outreached" if sent > 0 else "New")

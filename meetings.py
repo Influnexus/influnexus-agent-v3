@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -28,8 +28,8 @@ async def list_upcoming_meetings() -> str:
         if not service or not GCAL_CALENDAR_ID:
             return ""
 
-        now = datetime.utcnow().isoformat() + "Z"
-        week = (datetime.utcnow() + timedelta(days=7)).isoformat() + "Z"
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        week = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat().replace("+00:00", "Z")
 
         result = service.events().list(
             calendarId=GCAL_CALENDAR_ID,

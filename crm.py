@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime
 
 import gspread
@@ -42,30 +43,96 @@ def get_sheet():
     return ws
 
 
+def _sync_crm_dashboard() -> str:
+    ws = get_sheet()
+    data = ws.get_all_records()
+
+    if not data:
+        return "CRM is empty. Find some leads first!"
+
+    total = len(data)
+    statuses = {}
+    for row in data:
+        s = row.get("Status", "Unknown")
+        statuses[s] = statuses.get(s, 0) + 1
+
+    summary = f"*Total Leads:* {total}\n\n"
+    for status, count in sorted(statuses.items(), key=lambda x: -x[1]):
+        summary += f"  {status}: *{count}*\n"
+
+    recent = data[-5:]
+    summary += "\n*Recent Leads:*\n"
+    for r in reversed(recent):
+        summary += f"  {r.get('Name', 'N/A')} - {r.get('Company', 'N/A')} ({r.get('Status', 'New')})\n"
+
+    return summary
+
+
+def _sync_crm_add_lead(leads: list[dict], status: str = "New") -> int:
+    ws = get_sheet()
+    existing = ws.get_all_records()
+    existing_emails = {r.get("Email", "").lower() for r in existing}
+
+    rows = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    for lead in leads:
+        email = lead.get("email", "").lower()
+        if email and email in existing_emails:
+            continue
+        rows.append([
+            lead.get("name", ""),
+            lead.get("email", ""),
+            lead.get("phone", ""),
+            lead.get("company", ""),
+            lead.get("title", ""),
+            lead.get("linkedin", ""),
+            lead.get("source", ""),
+            status,
+            now,
+            "",  # Last Contacted
+            "",  # Follow-up Date
+            "",  # Notes
+        ])
+
+    if rows:
+        ws.append_rows(rows)
+    return len(rows)
+
+
+def _sync_crm_update_status(email: str, status: str):
+    ws = get_sheet()
+    cell = ws.find(email)
+    if cell:
+        ws.update_cell(cell.row, HEADERS.index("Status") + 1, status)
+        ws.update_cell(
+            cell.row,
+            HEADERS.index("Last Contacted") + 1,
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+
+
+def _sync_crm_get_leads_by_status(status: str) -> list[dict]:
+    ws = get_sheet()
+    return [r for r in ws.get_all_records() if r.get("Status") == status]
+
+
+def _sync_crm_get_followup_due() -> list[dict]:
+    ws = get_sheet()
+    today = datetime.now().strftime("%Y-%m-%d")
+    due = []
+    for row in ws.get_all_records():
+        f = row.get("Follow-up Date", "")
+        if f and f <= today and row.get("Status") not in ("Converted", "Not Interested"):
+            due.append(row)
+    return due
+
+
+# Async wrappers — run blocking gspread calls in a thread to avoid blocking the bot
+
 async def crm_dashboard() -> str:
     try:
-        ws = get_sheet()
-        data = ws.get_all_records()
-
-        if not data:
-            return "CRM is empty. Find some leads first!"
-
-        total = len(data)
-        statuses = {}
-        for row in data:
-            s = row.get("Status", "Unknown")
-            statuses[s] = statuses.get(s, 0) + 1
-
-        summary = f"*Total Leads:* {total}\n\n"
-        for status, count in sorted(statuses.items(), key=lambda x: -x[1]):
-            summary += f"  {status}: *{count}*\n"
-
-        recent = data[-5:]
-        summary += "\n*Recent Leads:*\n"
-        for r in reversed(recent):
-            summary += f"  {r.get('Name', 'N/A')} - {r.get('Company', 'N/A')} ({r.get('Status', 'New')})\n"
-
-        return summary
+        return await asyncio.get_event_loop().run_in_executor(None, _sync_crm_dashboard)
     except Exception as e:
         logger.error(f"CRM dashboard error: {e}")
         return f"Error loading CRM: {e}"
@@ -73,35 +140,9 @@ async def crm_dashboard() -> str:
 
 async def crm_add_lead(leads: list[dict], status: str = "New") -> int:
     try:
-        ws = get_sheet()
-        existing = ws.get_all_records()
-        existing_emails = {r.get("Email", "").lower() for r in existing}
-
-        rows = []
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        for lead in leads:
-            email = lead.get("email", "").lower()
-            if email and email in existing_emails:
-                continue
-            rows.append([
-                lead.get("name", ""),
-                lead.get("email", ""),
-                lead.get("phone", ""),
-                lead.get("company", ""),
-                lead.get("title", ""),
-                lead.get("linkedin", ""),
-                lead.get("source", ""),
-                status,
-                now,
-                "",  # Last Contacted
-                "",  # Follow-up Date
-                "",  # Notes
-            ])
-
-        if rows:
-            ws.append_rows(rows)
-        return len(rows)
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _sync_crm_add_lead, leads, status
+        )
     except Exception as e:
         logger.error(f"CRM add error: {e}")
         return 0
@@ -109,23 +150,18 @@ async def crm_add_lead(leads: list[dict], status: str = "New") -> int:
 
 async def crm_update_status(email: str, status: str):
     try:
-        ws = get_sheet()
-        cell = ws.find(email)
-        if cell:
-            ws.update_cell(cell.row, HEADERS.index("Status") + 1, status)
-            ws.update_cell(
-                cell.row,
-                HEADERS.index("Last Contacted") + 1,
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-            )
+        await asyncio.get_event_loop().run_in_executor(
+            None, _sync_crm_update_status, email, status
+        )
     except Exception as e:
         logger.error(f"CRM update error: {e}")
 
 
 async def crm_get_leads_by_status(status: str) -> list[dict]:
     try:
-        ws = get_sheet()
-        return [r for r in ws.get_all_records() if r.get("Status") == status]
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _sync_crm_get_leads_by_status, status
+        )
     except Exception as e:
         logger.error(f"CRM query error: {e}")
         return []
@@ -133,14 +169,9 @@ async def crm_get_leads_by_status(status: str) -> list[dict]:
 
 async def crm_get_followup_due() -> list[dict]:
     try:
-        ws = get_sheet()
-        today = datetime.now().strftime("%Y-%m-%d")
-        due = []
-        for row in ws.get_all_records():
-            f = row.get("Follow-up Date", "")
-            if f and f <= today and row.get("Status") not in ("Converted", "Not Interested"):
-                due.append(row)
-        return due
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _sync_crm_get_followup_due
+        )
     except Exception as e:
         logger.error(f"CRM followup error: {e}")
         return []

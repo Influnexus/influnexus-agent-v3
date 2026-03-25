@@ -187,6 +187,13 @@ async def outreach_preview(update: Update, context):
     context.user_data["email_subject"] = update.message.text
     leads = context.user_data.get("found_leads", [])
 
+    if not leads:
+        await update.message.reply_text(
+            "No leads loaded. Find leads first!",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text("Generating personalized email with AI...")
 
     preview = await generate_outreach_email(
