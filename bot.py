@@ -516,7 +516,18 @@ def main():
     # Global error handler — catches ALL unhandled exceptions
     app.add_error_handler(error_handler)
 
-    logger.info("Influnexus Agent started!")
+    # Log which services are configured so we can debug issues
+    from leads import APOLLO_API_KEY, HUNTER_API_KEY, SERPAPI_KEY
+    from outreach import GMAIL_REFRESH_TOKEN, SMTP_EMAIL, GMASS_API_KEY, GMAIL_SENDER_EMAIL
+    logger.info("=== Influnexus Agent starting ===")
+    logger.info(f"  APOLLO_API_KEY: {'SET' if APOLLO_API_KEY else 'NOT SET'}")
+    logger.info(f"  HUNTER_API_KEY: {'SET' if HUNTER_API_KEY else 'NOT SET'}")
+    logger.info(f"  SERPAPI_KEY: {'SET' if SERPAPI_KEY else 'NOT SET'}")
+    logger.info(f"  GMAIL_REFRESH_TOKEN: {'SET' if GMAIL_REFRESH_TOKEN else 'NOT SET'}")
+    logger.info(f"  GMAIL_SENDER_EMAIL: {GMAIL_SENDER_EMAIL or 'NOT SET'}")
+    logger.info(f"  SMTP_EMAIL: {'SET' if SMTP_EMAIL else 'NOT SET'}")
+    logger.info(f"  GMASS_API_KEY: {'SET' if GMASS_API_KEY else 'NOT SET'}")
+    logger.info("================================")
     app.run_polling(drop_pending_updates=True)
 
 

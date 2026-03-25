@@ -121,25 +121,33 @@ async def send_email_smtp(to_email: str, subject: str, body_html: str) -> dict:
 
 async def send_email(to_email: str, subject: str, body_html: str) -> dict:
     """Send email: tries Gmail API first, falls back to SMTP."""
-    # Try Gmail API first
+    # Nothing configured at all
+    if not GMAIL_REFRESH_TOKEN and not (SMTP_EMAIL and SMTP_PASSWORD):
+        return {"success": False, "error": "No email method configured. Set GMAIL_REFRESH_TOKEN or SMTP_EMAIL+SMTP_PASSWORD in Railway"}
+
+    errors = []
+
+    # Try Gmail API first (works on Railway, no port blocking)
     if GMAIL_REFRESH_TOKEN:
+        logger.info(f"Trying Gmail API for {to_email}...")
         result = await send_email_gmail_api(to_email, subject, body_html)
         if result["success"]:
             return result
-        logger.warning(f"Gmail API failed for {to_email}: {result['error']}")
+        errors.append(f"Gmail API: {result['error']}")
+        logger.error(f"Gmail API failed for {to_email}: {result['error']}")
+    else:
+        logger.warning("GMAIL_REFRESH_TOKEN not set — skipping Gmail API")
 
     # Try SMTP as fallback
     if SMTP_EMAIL and SMTP_PASSWORD:
+        logger.info(f"Trying SMTP for {to_email}...")
         result = await send_email_smtp(to_email, subject, body_html)
         if result["success"]:
             return result
-        logger.warning(f"SMTP also failed for {to_email}: {result['error']}")
+        errors.append(f"SMTP: {result['error']}")
+        logger.error(f"SMTP failed for {to_email}: {result['error']}")
 
-    # Nothing configured
-    if not GMAIL_REFRESH_TOKEN and not (SMTP_EMAIL and SMTP_PASSWORD):
-        return {"success": False, "error": "No email sending method configured. Set GMAIL_REFRESH_TOKEN or SMTP_EMAIL+SMTP_PASSWORD"}
-
-    return result
+    return {"success": False, "error": " | ".join(errors)}
 
 
 # ── GMass bulk sender ───────────────────────────────────────────────

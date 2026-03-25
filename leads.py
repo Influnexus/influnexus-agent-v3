@@ -1,5 +1,7 @@
 import os
+import re
 import logging
+import asyncio
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -15,6 +17,65 @@ LEADS_COUNT = 2
 
 # Shared timeout for all API calls
 API_TIMEOUT = aiohttp.ClientTimeout(total=20)
+
+# Email regex for scraping websites
+EMAIL_REGEX = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+)
+
+# Domains to ignore when scraping emails
+JUNK_EMAIL_DOMAINS = {
+    "example.com", "email.com", "yourdomain.com", "domain.com",
+    "sentry.io", "wixpress.com", "googleapis.com", "w3.org",
+    "schema.org", "gravatar.com", "wordpress.org", "wp.com",
+    "cloudflare.com", "google.com", "facebook.com", "twitter.com",
+}
+
+
+async def scrape_website_emails(url: str) -> list[str]:
+    """Scrape a website page for email addresses."""
+    if not url:
+        return []
+
+    # Ensure URL has protocol
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; InflunexusBot/1.0)"}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Try the main page first
+            emails = set()
+            for path in ["", "/contact", "/contact-us", "/about", "/about-us"]:
+                try:
+                    target = url.rstrip("/") + path
+                    async with session.get(target, headers=headers, allow_redirects=True, ssl=False) as resp:
+                        if resp.status != 200:
+                            continue
+                        text = await resp.text(errors="ignore")
+                        found = EMAIL_REGEX.findall(text)
+                        for em in found:
+                            em_lower = em.lower()
+                            domain = em_lower.split("@")[1]
+                            # Filter out junk emails
+                            if domain not in JUNK_EMAIL_DOMAINS and not em_lower.endswith((".png", ".jpg", ".gif", ".css", ".js")):
+                                emails.add(em_lower)
+                except Exception:
+                    continue
+
+                # Stop if we found emails
+                if emails:
+                    break
+
+            result = list(emails)[:3]  # Max 3 emails per site
+            if result:
+                logger.info(f"Scraped {len(result)} emails from {url}: {result}")
+            return result
+
+    except Exception as e:
+        logger.debug(f"Scrape error for {url}: {e}")
+        return []
 
 
 async def find_email_hunter(first_name: str, last_name: str, company_domain: str) -> str:
@@ -80,6 +141,40 @@ async def enrich_with_hunter(domain: str) -> list[dict]:
         return []
 
 
+async def enrich_email(name: str, domain: str, website: str) -> tuple[str, str]:
+    """Try all methods to find an email: Hunter person -> Hunter domain -> Website scrape.
+    Returns (email, source_suffix) e.g. ("john@co.com", "+Hunter") or ("info@co.com", "+Web")
+    """
+    # 1) Hunter email-finder (person-level)
+    if HUNTER_API_KEY and domain and name:
+        parts = name.split(" ", 1)
+        first = parts[0] if parts else ""
+        last = parts[1] if len(parts) > 1 else ""
+        email = await find_email_hunter(first, last, domain)
+        if email:
+            logger.info(f"Hunter email-finder found {email} for {name}")
+            return email, "+Hunter"
+
+    # 2) Hunter domain search
+    if HUNTER_API_KEY and domain:
+        hunter_results = await enrich_with_hunter(domain)
+        if hunter_results:
+            email = hunter_results[0].get("email", "")
+            if email:
+                logger.info(f"Hunter domain-search found {email} for {domain}")
+                return email, "+Hunter"
+
+    # 3) Scrape the company website for emails
+    scrape_url = website or (f"https://{domain}" if domain else "")
+    if scrape_url:
+        scraped = await scrape_website_emails(scrape_url)
+        if scraped:
+            logger.info(f"Website scrape found {scraped[0]} from {scrape_url}")
+            return scraped[0], "+Web"
+
+    return "", ""
+
+
 async def search_apollo(industry: str, location: str, count: int) -> list[dict]:
     """Search Apollo for B2B people data."""
     if not APOLLO_API_KEY:
@@ -118,22 +213,11 @@ async def search_apollo(industry: str, location: str, count: int) -> list[dict]:
             company = (p.get("organization") or {}).get("name", "") or ""
             domain = (p.get("organization") or {}).get("primary_domain", "") or ""
 
-            # If Apollo didn't give email, try Hunter email-finder
-            if not email and HUNTER_API_KEY and domain and name:
-                parts = name.split(" ", 1)
-                first = parts[0] if parts else ""
-                last = parts[1] if len(parts) > 1 else ""
-                email = await find_email_hunter(first, last, domain)
-                if email:
-                    logger.info(f"Hunter found email for {name}: {email}")
-
-            # If still no email, try Hunter domain search
-            if not email and HUNTER_API_KEY and domain:
-                hunter_results = await enrich_with_hunter(domain)
-                if hunter_results:
-                    email = hunter_results[0].get("email", "")
-                    if email:
-                        logger.info(f"Hunter domain search found: {email}")
+            # If Apollo didn't give email, try all enrichment methods
+            source_suffix = ""
+            website = (p.get("organization") or {}).get("website_url", "") or ""
+            if not email:
+                email, source_suffix = await enrich_email(name, domain, website)
 
             leads.append({
                 "name": name,
@@ -143,7 +227,8 @@ async def search_apollo(industry: str, location: str, count: int) -> list[dict]:
                 "title": p.get("title", "") or "",
                 "linkedin": p.get("linkedin_url", "") or "",
                 "domain": domain,
-                "source": "Apollo" + ("+Hunter" if email and not p.get("email") else ""),
+                "website": website or (f"https://{domain}" if domain else ""),
+                "source": "Apollo" + source_suffix,
             })
         return leads
 
@@ -193,29 +278,21 @@ async def search_serpapi_maps(industry: str, location: str, count: int) -> list[
                     .split("?")[0]
                 )
 
-            lead = {
-                "name": r.get("title", "") or "",
-                "email": "",
+            biz_name = r.get("title", "") or ""
+            email, source_suffix = await enrich_email(biz_name, domain, website)
+
+            leads.append({
+                "name": biz_name,
+                "email": email,
                 "phone": r.get("phone", "") or "",
-                "company": r.get("title", "") or "",
+                "company": biz_name,
                 "title": "Business Owner",
                 "linkedin": "",
                 "website": website,
                 "domain": domain,
                 "address": r.get("address", "") or "",
-                "source": "GoogleMaps",
-            }
-
-            # Enrich with Hunter for email
-            if domain and HUNTER_API_KEY:
-                hunter = await enrich_with_hunter(domain)
-                if hunter:
-                    lead["email"] = hunter[0].get("email", "")
-                    if hunter[0].get("name"):
-                        lead["name"] = hunter[0]["name"]
-                    lead["source"] = "GoogleMaps+Hunter"
-
-            leads.append(lead)
+                "source": "GoogleMaps" + source_suffix,
+            })
 
         return leads[:count]
 
@@ -259,68 +336,44 @@ async def search_serpapi(industry: str, location: str, count: int) -> list[dict]
             website = r.get("website", "") or ""
             domain = ""
             if website:
-                domain = (
-                    website
-                    .replace("https://", "")
-                    .replace("http://", "")
-                    .split("/")[0]
-                    .split("?")[0]
-                )
+                domain = website.replace("https://", "").replace("http://", "").split("/")[0].split("?")[0]
 
-            lead = {
-                "name": r.get("title", "") or "",
-                "email": "",
+            biz_name = r.get("title", "") or ""
+            email, source_suffix = await enrich_email(biz_name, domain, website)
+
+            leads.append({
+                "name": biz_name,
+                "email": email,
                 "phone": r.get("phone", "") or "",
-                "company": r.get("title", "") or "",
+                "company": biz_name,
                 "title": "Business Owner",
                 "linkedin": "",
                 "website": website,
                 "domain": domain,
-                "source": "SerpAPI",
-            }
-
-            if domain and HUNTER_API_KEY:
-                hunter = await enrich_with_hunter(domain)
-                if hunter:
-                    lead["email"] = hunter[0].get("email", "")
-                    if hunter[0].get("name"):
-                        lead["name"] = hunter[0]["name"]
-                    lead["source"] = "SerpAPI+Hunter"
-            leads.append(lead)
+                "source": "SerpAPI" + source_suffix,
+            })
 
         # Organic results
         for r in data.get("organic_results", [])[:count]:
             link = r.get("link", "") or ""
             domain = ""
             if link:
-                domain = (
-                    link
-                    .replace("https://", "")
-                    .replace("http://", "")
-                    .split("/")[0]
-                    .split("?")[0]
-                )
+                domain = link.replace("https://", "").replace("http://", "").split("/")[0].split("?")[0]
 
-            lead = {
-                "name": r.get("title", "") or "",
-                "email": "",
+            title = r.get("title", "") or ""
+            email, source_suffix = await enrich_email(title, domain, link)
+
+            leads.append({
+                "name": title,
+                "email": email,
                 "phone": "",
-                "company": r.get("title", "") or "",
+                "company": title,
                 "title": "",
                 "linkedin": "",
                 "website": link,
                 "domain": domain,
-                "source": "SerpAPI",
-            }
-
-            if domain and HUNTER_API_KEY:
-                hunter = await enrich_with_hunter(domain)
-                if hunter:
-                    lead["email"] = hunter[0].get("email", "")
-                    if hunter[0].get("name"):
-                        lead["name"] = hunter[0]["name"]
-                    lead["source"] = "SerpAPI+Hunter"
-            leads.append(lead)
+                "source": "SerpAPI" + source_suffix,
+            })
 
         return leads[:count]
 
