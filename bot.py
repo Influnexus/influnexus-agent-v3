@@ -477,16 +477,24 @@ async def test_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = "Email Diagnostics:\n\n"
 
-    # Check what's set
-    msg += "Variables:\n"
-    msg += f"  GMAIL_CLIENT_ID: {'SET (' + str(len(GMAIL_CLIENT_ID)) + ' chars)' if GMAIL_CLIENT_ID else 'NOT SET'}\n"
+    # Show first + last chars so user can compare with local values
+    msg += "Variables on Railway:\n"
     if GMAIL_CLIENT_ID:
-        msg += f"    ends with: ...{GMAIL_CLIENT_ID[-25:]}\n"
-    msg += f"  GMAIL_CLIENT_SECRET: {'SET (' + str(len(GMAIL_CLIENT_SECRET)) + ' chars)' if GMAIL_CLIENT_SECRET else 'NOT SET'}\n"
-    msg += f"  GMAIL_REFRESH_TOKEN: {'SET (' + str(len(GMAIL_REFRESH_TOKEN)) + ' chars)' if GMAIL_REFRESH_TOKEN else 'NOT SET'}\n"
-    msg += f"  GMAIL_SENDER_EMAIL: {GMAIL_SENDER_EMAIL or 'NOT SET'}\n"
+        msg += f"  CLIENT_ID: {GMAIL_CLIENT_ID[:15]}...{GMAIL_CLIENT_ID[-30:]} ({len(GMAIL_CLIENT_ID)} chars)\n"
+    else:
+        msg += "  CLIENT_ID: NOT SET\n"
+    if GMAIL_CLIENT_SECRET:
+        msg += f"  CLIENT_SECRET: {GMAIL_CLIENT_SECRET[:10]}... ({len(GMAIL_CLIENT_SECRET)} chars)\n"
+    else:
+        msg += "  CLIENT_SECRET: NOT SET\n"
+    if GMAIL_REFRESH_TOKEN:
+        msg += f"  REFRESH_TOKEN: {GMAIL_REFRESH_TOKEN[:10]}...{GMAIL_REFRESH_TOKEN[-10:]} ({len(GMAIL_REFRESH_TOKEN)} chars)\n"
+    else:
+        msg += "  REFRESH_TOKEN: NOT SET\n"
+    msg += f"  SENDER_EMAIL: {GMAIL_SENDER_EMAIL or 'NOT SET'}\n"
     msg += f"  SMTP_EMAIL: {'SET' if SMTP_EMAIL else 'NOT SET'}\n"
     msg += f"  SMTP_PASSWORD: {'SET' if SMTP_PASSWORD else 'NOT SET'}\n\n"
+    msg += "Compare these with your local values!\n\n"
 
     await update.message.reply_text(msg)
 
