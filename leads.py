@@ -242,30 +242,111 @@ async def search_serpapi(industry: str, location: str, count: int) -> list[dict]
         return []
 
 
+async def search_serpapi_maps(industry: str, location: str, count: int) -> list[dict]:
+    """Search Google Maps via SerpAPI for local businesses with contact info."""
+    if not SERPAPI_KEY:
+        logger.warning("SERPAPI_KEY not set")
+        return []
+
+    query = f"{industry} in {location}"
+    params = {
+        "q": query,
+        "api_key": SERPAPI_KEY,
+        "engine": "google_maps",
+        "type": "search",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://serpapi.com/search.json", params=params
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"SerpAPI Maps error: {resp.status}")
+                    return []
+                data = await resp.json()
+
+        leads = []
+        for r in data.get("local_results", []):
+            website = r.get("website", "")
+            domain = ""
+            if website:
+                domain = (
+                    website
+                    .replace("https://", "")
+                    .replace("http://", "")
+                    .split("/")[0]
+                )
+
+            lead = {
+                "name": r.get("title", ""),
+                "email": "",
+                "phone": r.get("phone", ""),
+                "company": r.get("title", ""),
+                "title": "Business Owner",
+                "linkedin": "",
+                "website": website,
+                "domain": domain,
+                "address": r.get("address", ""),
+                "source": "GoogleMaps",
+            }
+
+            # Enrich with Hunter for email
+            if domain and HUNTER_API_KEY:
+                hunter = await enrich_with_hunter(domain)
+                if hunter:
+                    lead["email"] = hunter[0].get("email", "")
+                    if hunter[0].get("name"):
+                        lead["name"] = hunter[0]["name"]
+                    lead["source"] = "GoogleMaps+Hunter"
+
+            leads.append(lead)
+
+        return leads[:count]
+    except Exception as e:
+        logger.error(f"SerpAPI Maps error: {e}")
+        return []
+
+
 async def find_leads_flow(industry: str, location: str, count: int) -> list[dict]:
     leads = []
 
-    # 1) Apollo (best for B2B) + auto Hunter enrichment
+    # 1) Apollo (best for B2B people data) + auto Hunter enrichment
     apollo_leads = await search_apollo(industry, location, count)
     leads.extend(apollo_leads)
     logger.info(f"Apollo returned {len(apollo_leads)} leads, {sum(1 for l in apollo_leads if l.get('email'))} with emails")
 
-    # 2) SerpAPI + Hunter if we need more
+    # 2) Google Maps (best for local businesses with phone/website)
+    remaining = count - len(leads)
+    if remaining > 0:
+        maps_leads = await search_serpapi_maps(industry, location, remaining)
+        leads.extend(maps_leads)
+        logger.info(f"Google Maps returned {len(maps_leads)} leads, {sum(1 for l in maps_leads if l.get('email'))} with emails")
+
+    # 3) SerpAPI Google web search if we still need more
     remaining = count - len(leads)
     if remaining > 0:
         serp_leads = await search_serpapi(industry, location, remaining)
         leads.extend(serp_leads)
-        logger.info(f"SerpAPI returned {len(serp_leads)} leads, {sum(1 for l in serp_leads if l.get('email'))} with emails")
+        logger.info(f"SerpAPI web returned {len(serp_leads)} leads, {sum(1 for l in serp_leads if l.get('email'))} with emails")
 
-    # Deduplicate by email
-    seen = set()
+    # Deduplicate by email and by domain
+    seen_emails = set()
+    seen_domains = set()
     unique = []
     for lead in leads:
         email = lead.get("email", "")
-        if email and email in seen:
+        domain = lead.get("domain", "")
+
+        if email and email in seen_emails:
             continue
+        if not email and domain and domain in seen_domains:
+            continue
+
         if email:
-            seen.add(email)
+            seen_emails.add(email)
+        if domain:
+            seen_domains.add(domain)
         unique.append(lead)
 
     total_with_email = sum(1 for l in unique if l.get("email"))

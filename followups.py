@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta
 
 from crm import crm_get_followup_due, crm_get_leads_by_status, crm_update_status
-from outreach import send_email_smtp
+from outreach import send_email
 from ai_helper import generate_followup_email
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,8 @@ async def send_followups() -> str:
         })
 
         subject = f"Following up - {lead.get('Company') or lead.get('Name', '')}"
-        if await send_email_smtp(email, subject, body):
+        result = await send_email(email, subject, body)
+        if result["success"]:
             sent += 1
             await crm_update_status(email, "Followed Up")
         else:
