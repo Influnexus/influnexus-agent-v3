@@ -195,17 +195,36 @@ async def do_find_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["found_leads"] = leads
 
     with_email = sum(1 for l in leads if l.get("email"))
-    msg = f"Found {len(leads)} leads ({with_email} with email):\n\n"
+
+    # Build lead list in chunks to stay under Telegram's 4096 char limit
+    header = f"Found {len(leads)} leads ({with_email} with email):\n\n"
+    chunks = [header]
+    current = header
+
     for i, lead in enumerate(leads, 1):
-        email_display = lead.get("email") or "No email found"
-        name = escape_md(lead.get("name", "N/A"))
-        company = escape_md(lead.get("company", "N/A"))
-        msg += (
+        email_display = lead.get("email") or "No email"
+        name = lead.get("name", "N/A")[:40]
+        company = lead.get("company", "N/A")[:40]
+        entry = (
             f"{i}. {name}\n"
-            f"   Company: {company}\n"
-            f"   Email: {email_display}\n"
-            f"   Phone: {lead.get('phone') or 'N/A'}\n\n"
+            f"   {company} | {email_display}\n"
+            f"   {lead.get('phone') or ''}\n\n"
         )
+
+        if len(current) + len(entry) > 3800:
+            chunks.append(current)
+            current = ""
+        current += entry
+
+    # Send lead list in multiple messages if needed
+    if len(chunks) == 1:
+        # Everything fits in one message — just send header + leads
+        await update.message.reply_text(current)
+    else:
+        chunks.append(current)
+        for chunk in chunks[1:]:  # Skip empty header duplicate
+            if chunk.strip():
+                await update.message.reply_text(chunk)
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -215,8 +234,10 @@ async def do_find_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Main Menu", callback_data="main_menu")],
     ])
 
-    # Send without Markdown to avoid escaping issues with lead data
-    await update.message.reply_text(msg, reply_markup=keyboard)
+    await update.message.reply_text(
+        f"{with_email} of {len(leads)} leads have email. What next?",
+        reply_markup=keyboard,
+    )
     return ConversationHandler.END
 
 
