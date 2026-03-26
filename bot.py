@@ -321,19 +321,29 @@ async def outreach_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(query, "No leads loaded.", MAIN_MENU)
         return ConversationHandler.END
 
-    await query.edit_message_text("Sending emails... This may take a minute.")
+    await query.edit_message_text("Sending outreach... This may take a minute.\n(Email + WhatsApp + Telegram)")
 
     try:
         results = await outreach_flow(leads=leads, subject=subject)
     except Exception as e:
         logger.error(f"Outreach flow error: {e}")
-        results = {"sent": 0, "failed": len(leads), "errors": [str(e)]}
+        results = {"email_sent": 0, "whatsapp_sent": 0, "telegram_sent": 0, "failed": len(leads), "errors": [str(e)]}
 
-    msg = (
-        f"Outreach Complete!\n\n"
-        f"Sent: {results['sent']}\n"
-        f"Failed: {results['failed']}\n"
-    )
+    email_sent = results.get("email_sent", results.get("sent", 0))
+    wa_sent = results.get("whatsapp_sent", 0)
+    tg_sent = results.get("telegram_sent", 0)
+    total_sent = email_sent + wa_sent + tg_sent
+
+    msg = f"Outreach Complete!\n\n"
+    if email_sent:
+        msg += f"Email sent: {email_sent}\n"
+    if wa_sent:
+        msg += f"WhatsApp sent: {wa_sent}\n"
+    if tg_sent:
+        msg += f"Telegram sent: {tg_sent}\n"
+    if total_sent == 0:
+        msg += f"Sent: 0\n"
+    msg += f"Failed: {results['failed']}\n"
 
     errors = results.get("errors", [])
     if errors:
@@ -527,6 +537,34 @@ async def test_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"SMTP: SUCCESS! Email sent to {test_to}")
         else:
             await update.message.reply_text(f"SMTP: FAILED\n{result['error']}")
+
+    # Test WhatsApp
+    await update.message.reply_text("Testing WhatsApp...")
+    from whatsapp import test_whatsapp, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN
+    if WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_ACCESS_TOKEN:
+        wa_result = await test_whatsapp()
+        if wa_result["success"]:
+            await update.message.reply_text(f"WhatsApp: SUCCESS! Phone: {wa_result.get('phone', 'N/A')}")
+        else:
+            await update.message.reply_text(f"WhatsApp: FAILED\n{wa_result['error']}")
+    else:
+        await update.message.reply_text("WhatsApp: NOT CONFIGURED\nAdd WHATSAPP_PHONE_NUMBER_ID + WHATSAPP_ACCESS_TOKEN")
+
+    # Test Telegram Outreach (Telethon)
+    await update.message.reply_text("Testing Telegram Outreach...")
+    from telegram_outreach import test_telegram_outreach, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING
+    if all([TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING]):
+        tg_result = await test_telegram_outreach()
+        if tg_result["success"]:
+            await update.message.reply_text(f"Telegram Outreach: SUCCESS! Account: {tg_result.get('account', 'N/A')}")
+        else:
+            await update.message.reply_text(f"Telegram Outreach: FAILED\n{tg_result['error']}")
+    else:
+        missing = []
+        if not TELEGRAM_API_ID: missing.append("TELEGRAM_API_ID")
+        if not TELEGRAM_API_HASH: missing.append("TELEGRAM_API_HASH")
+        if not TELEGRAM_SESSION_STRING: missing.append("TELEGRAM_SESSION_STRING")
+        await update.message.reply_text(f"Telegram Outreach: NOT CONFIGURED\nMissing: {', '.join(missing)}")
 
     await update.message.reply_text("Diagnostics complete.", reply_markup=MAIN_MENU)
 

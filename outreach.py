@@ -14,6 +14,8 @@ from googleapiclient.discovery import build
 
 from ai_helper import generate_outreach_email
 from crm import crm_add_lead, crm_update_status
+from whatsapp import send_whatsapp_template
+from telegram_outreach import send_telegram_dm
 
 logger = logging.getLogger(__name__)
 
@@ -194,55 +196,102 @@ async def send_via_gmass(leads: list[dict], subject: str) -> dict:
         return {"sent": 0, "failed": len(email_list), "errors": [str(e)]}
 
 
+# ── Phone outreach (WhatsApp + Telegram) ─────────────────────────
+
+async def send_phone_outreach(lead: dict, subject: str) -> dict:
+    """Try WhatsApp first, then Telegram DM for a phone-only lead."""
+    phone = lead.get("phone", "")
+    name = lead.get("name", "")
+    company = lead.get("company", "")
+
+    # Generate a plain text message for phone outreach
+    first_name = name.split()[0] if name else "there"
+    message = (
+        f"Hi {first_name}, I came across {company or 'your business'} "
+        f"and was impressed by your work. "
+        f"I believe our services could help you achieve even greater results. "
+        f"Would you be open to a quick chat? "
+        f"Looking forward to hearing from you!"
+    )
+
+    # 1) Try WhatsApp Business API
+    wa_result = await send_whatsapp_template(phone, name)
+    if wa_result["success"]:
+        return {"success": True, "channel": "WhatsApp", "error": ""}
+
+    wa_error = wa_result["error"]
+    logger.info(f"WhatsApp failed for {phone}: {wa_error}, trying Telegram...")
+
+    # 2) Try Telegram DM via Telethon
+    tg_result = await send_telegram_dm(phone, message, name)
+    if tg_result["success"]:
+        return {"success": True, "channel": "Telegram", "error": ""}
+
+    tg_error = tg_result["error"]
+
+    # Both failed
+    return {
+        "success": False,
+        "channel": "",
+        "error": f"WA: {wa_error} | TG: {tg_error}",
+    }
+
+
 # ── Main outreach flow ──────────────────────────────────────────────
 
 async def outreach_flow(leads: list[dict], subject: str) -> dict:
     errors = []
 
-    leads_with_email = [l for l in leads if l.get("email") and "@" in l.get("email", "")]
-    leads_without_email = len(leads) - len(leads_with_email)
+    # Categorize leads
+    leads_with_email = []
+    leads_phone_only = []
+    leads_no_contact = []
 
-    if not leads_with_email:
+    for lead in leads:
+        has_email = lead.get("email") and "@" in lead.get("email", "")
+        has_phone = lead.get("phone") and len(lead.get("phone", "").strip()) >= 7
+
+        if has_email:
+            leads_with_email.append(lead)
+        elif has_phone:
+            leads_phone_only.append(lead)
+        else:
+            leads_no_contact.append(lead)
+
+    logger.info(f"Outreach: {len(leads_with_email)} email, {len(leads_phone_only)} phone-only, {len(leads_no_contact)} no contact")
+
+    if not leads_with_email and not leads_phone_only:
         return {
-            "sent": 0,
+            "email_sent": 0, "whatsapp_sent": 0, "telegram_sent": 0,
             "failed": len(leads),
             "errors": [
-                f"None of the {len(leads)} leads have email addresses.",
+                f"None of the {len(leads)} leads have email or phone.",
                 "Tip: Make sure HUNTER_API_KEY is set to enrich leads with emails.",
             ],
         }
 
-    if leads_without_email > 0:
-        errors.append(f"{leads_without_email} leads skipped (no email)")
+    if leads_no_contact:
+        errors.append(f"{len(leads_no_contact)} leads skipped (no email or phone)")
 
-    # Log credential status for debugging
-    logger.info(f"GMAIL_CLIENT_ID length: {len(GMAIL_CLIENT_ID)}")
-    logger.info(f"GMAIL_CLIENT_SECRET length: {len(GMAIL_CLIENT_SECRET)}")
-    logger.info(f"GMAIL_REFRESH_TOKEN length: {len(GMAIL_REFRESH_TOKEN)}")
-    logger.info(f"GMAIL_SENDER_EMAIL: {GMAIL_SENDER_EMAIL}")
-    logger.info(f"GMAIL_CLIENT_ID ends with: ...{GMAIL_CLIENT_ID[-30:]}" if GMAIL_CLIENT_ID else "GMAIL_CLIENT_ID is empty")
+    # ── EMAIL OUTREACH ──
+    email_sent = 0
+    email_failed = 0
+    email_auth_failed = False
 
-    # Skip GMass — use Gmail API directly (GMass key is unreliable)
-    # If you want GMass back, remove this comment and uncomment below
-    # if GMASS_API_KEY:
-    #     result = await send_via_gmass(leads_with_email, subject)
-    #     if result["sent"] > 0:
-    #         await crm_add_lead(leads, status="Outreached")
-    #         result["errors"] = errors + result.get("errors", [])
-    #         return result
-
-    # Individual emails via Gmail API / SMTP
-    sent = 0
-    failed = 0
     for lead in leads_with_email:
+        if email_auth_failed:
+            email_failed += 1
+            continue
+
         email = lead["email"]
 
         try:
             body = await generate_outreach_email(lead, subject)
         except Exception as e:
             logger.error(f"Email generation error for {email}: {e}")
+            first = lead.get("name", "there").split()[0] if lead.get("name") else "there"
             body = (
-                f"<p>Hi {lead.get('name', 'there').split()[0] if lead.get('name') else 'there'},</p>"
+                f"<p>Hi {first},</p>"
                 f"<p>I came across {lead.get('company', 'your company')} and was impressed. "
                 f"Would you be open to a quick call this week?</p>"
                 f"<p>Best regards</p>"
@@ -251,25 +300,63 @@ async def outreach_flow(leads: list[dict], subject: str) -> dict:
         result = await send_email(email, subject, body)
 
         if result["success"]:
-            sent += 1
+            email_sent += 1
             try:
                 await crm_update_status(email, "Outreached")
             except Exception as e:
                 logger.error(f"CRM update error: {e}")
         else:
-            failed += 1
+            email_failed += 1
             errors.append(f"{email}: {result['error']}")
-            # If auth error, stop trying all remaining
             if any(x in result["error"].lower() for x in ["login failed", "credentials", "refresh token", "invalid_grant"]):
-                remaining = len(leads_with_email) - sent - failed
+                email_auth_failed = True
+                remaining = len(leads_with_email) - email_sent - email_failed
                 if remaining > 0:
                     errors.append(f"Auth error - skipping {remaining} remaining emails")
-                    failed += remaining
-                break
+                    email_failed += remaining
 
+    # ── PHONE OUTREACH (WhatsApp + Telegram) ──
+    whatsapp_sent = 0
+    telegram_sent = 0
+    phone_failed = 0
+
+    for lead in leads_phone_only:
+        phone = lead.get("phone", "")
+        result = await send_phone_outreach(lead, subject)
+
+        if result["success"]:
+            channel = result["channel"]
+            if channel == "WhatsApp":
+                whatsapp_sent += 1
+            else:
+                telegram_sent += 1
+            try:
+                await crm_update_status(phone, f"{channel} Sent")
+            except Exception:
+                pass
+
+            # Check for Telegram flood/ban errors — stop if detected
+            if "flood" in result.get("error", "").lower() or "banned" in result.get("error", "").lower():
+                remaining = len(leads_phone_only) - whatsapp_sent - telegram_sent - phone_failed
+                if remaining > 0:
+                    errors.append(f"Rate limited - skipping {remaining} remaining phone leads")
+                    phone_failed += remaining
+                break
+        else:
+            phone_failed += 1
+            errors.append(f"{phone}: {result['error']}")
+
+    # Save all leads to CRM
+    any_sent = email_sent + whatsapp_sent + telegram_sent
     try:
-        await crm_add_lead(leads, status="Outreached" if sent > 0 else "New")
+        await crm_add_lead(leads, status="Outreached" if any_sent > 0 else "New")
     except Exception as e:
         logger.error(f"CRM save error: {e}")
 
-    return {"sent": sent, "failed": failed + leads_without_email, "errors": errors}
+    return {
+        "email_sent": email_sent,
+        "whatsapp_sent": whatsapp_sent,
+        "telegram_sent": telegram_sent,
+        "failed": email_failed + phone_failed + len(leads_no_contact),
+        "errors": errors,
+    }
